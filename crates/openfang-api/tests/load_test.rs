@@ -56,6 +56,10 @@ async fn start_test_server() -> TestServer {
         peer_registry: None,
         bridge_manager: tokio::sync::Mutex::new(None),
         channels_config: tokio::sync::RwLock::new(Default::default()),
+        config_write_lock: std::sync::Mutex::new(()),
+        last_config_write_fingerprint: tokio::sync::RwLock::new(None),
+        model_warnings: tokio::sync::RwLock::new(Vec::new()),
+        openrouter_catalog_cache: tokio::sync::RwLock::new(None),
         shutdown_notify: Arc::new(tokio::sync::Notify::new()),
     });
 

@@ -2926,6 +2926,120 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
               <h4>Model Catalog</h4>
               <p>Browse all available models across providers. Models marked "Available" have their provider configured and ready to use.</p>
             </div>
+            <div class="card mb-4" x-show="activeModel" style="border-left:3px solid var(--accent)">
+              <div class="flex justify-between items-center">
+                <div>
+                  <div class="card-header" style="margin:0">Active Runtime Model</div>
+                  <div class="text-xs text-dim mt-1">This is the currently configured global default route.</div>
+                </div>
+                <span class="badge" :class="modelStatusBadgeClass(activeModel && activeModel.status)" x-text="modelStatusText(activeModel && activeModel.status)"></span>
+              </div>
+              <div class="text-sm mt-2" style="font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" x-text="activeModel ? (activeModel.display_id || (activeModel.provider + '/' + activeModel.model)) : '-'"></div>
+              <div class="text-xs text-dim mt-1">Global default is editable here; some agent manifests may override at execution time.</div>
+            </div>
+
+            <div class="card mb-4" x-show="modelWarnings && modelWarnings.length">
+              <div class="card-header" style="margin-bottom:8px">Model Warnings</div>
+              <template x-for="w in modelWarnings" :key="w">
+                <div class="text-xs" style="color:var(--warning);margin-bottom:4px" x-text="formatModelWarning(w)"></div>
+              </template>
+            </div>
+
+            <div class="card mb-4">
+              <div class="flex justify-between items-start" style="gap:12px;flex-wrap:wrap">
+                <div>
+                  <div class="card-header" style="margin:0">Custom Models (OpenRouter)</div>
+                  <div class="text-xs text-dim mt-1">Paste a model ID from OpenRouter (for example <code>z-ai/glm-5</code> or <code>openrouter/z-ai/glm-5</code>), verify it, then save.</div>
+                </div>
+              </div>
+              <div class="detail-grid mt-3" style="gap:10px">
+                <div class="detail-row" style="align-items:center">
+                  <span class="detail-label">Model ID</span>
+                  <input class="form-input" type="text" placeholder="z-ai/glm-5" x-model="customModelInput" style="flex:1;min-width:260px">
+                </div>
+                <div class="detail-row" style="align-items:center">
+                  <span class="detail-label">Label (optional)</span>
+                  <input class="form-input" type="text" placeholder="Team GLM 5" x-model="customModelLabel" style="flex:1;min-width:260px">
+                </div>
+                <div class="detail-row" style="align-items:center">
+                  <span class="detail-label">Actions</span>
+                  <div class="flex gap-2" style="flex-wrap:wrap">
+                    <button class="btn btn-ghost btn-sm" @click="verifyCustomModel()" :disabled="customModelVerifying || !customModelInput">
+                      <span x-show="!customModelVerifying">Verify</span>
+                      <span x-show="customModelVerifying" class="spinner" style="width:12px;height:12px;border-width:2px"></span>
+                    </button>
+                    <button class="btn btn-primary btn-sm" @click="saveCustomModel()" :disabled="customModelSaving || !customModelInput">
+                      <span x-show="!customModelSaving">Save Model</span>
+                      <span x-show="customModelSaving" class="spinner" style="width:12px;height:12px;border-width:2px"></span>
+                    </button>
+                  </div>
+                </div>
+                <div class="detail-row" x-show="customModelVerifyResult" style="align-items:flex-start">
+                  <span class="detail-label">Verify Result</span>
+                  <div>
+                    <span class="badge" :class="customModelVerifyResult && customModelVerifyResult.verified ? 'badge-success' : 'badge-warning'" x-text="customModelVerifyResult && customModelVerifyResult.verified ? 'Verified' : 'Unverified'"></span>
+                    <div class="text-xs mt-1" style="font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" x-text="customModelVerifyResult && (customModelVerifyResult.display_id || customModelVerifyResult.normalized_model)"></div>
+                    <div class="text-xs text-dim mt-1" x-text="customModelVerifyResult && (customModelVerifyResult.reason || 'Ready to save')"></div>
+                  </div>
+                </div>
+              </div>
+
+              <div class="table-wrap mt-4" x-show="filteredCustomModels.length">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Model</th>
+                      <th>Label</th>
+                      <th>Status</th>
+                      <th>Verified At</th>
+                      <th>Last Error</th>
+                      <th>Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <template x-for="m in filteredCustomModels" :key="'custom-' + m.provider + '-' + m.model">
+                      <tr>
+                        <td>
+                          <div class="font-bold text-xs" style="font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" x-text="m.display_id || ('openrouter/' + m.model)"></div>
+                          <div class="text-xs text-dim" x-text="m.model"></div>
+                        </td>
+                        <td class="text-xs" x-text="m.label || '-'"></td>
+                        <td>
+                          <span class="badge" :class="modelStatusBadgeClass(m.runtime_status || m.status)" x-text="modelStatusText(m.runtime_status || m.status)"></span>
+                        </td>
+                        <td class="text-xs" x-text="formatVerifiedAt(m.verified_at)"></td>
+                        <td class="text-xs text-dim" x-text="m.last_error || '-'"></td>
+                        <td>
+                          <div class="flex gap-1" style="flex-wrap:wrap">
+                            <button class="btn btn-ghost btn-sm"
+                              @click="useCustomModel(m, 'default')"
+                              :disabled="customModelUseBusy['default:' + (m.provider || 'openrouter') + ':' + m.model]">
+                              Use Default
+                            </button>
+                            <button class="btn btn-ghost btn-sm"
+                              @click="useCustomModel(m, 'fallback')"
+                              :disabled="customModelUseBusy['fallback:' + (m.provider || 'openrouter') + ':' + m.model]">
+                              Add Fallback
+                            </button>
+                            <button class="btn btn-ghost btn-sm" style="color:var(--error)"
+                              @click="removeCustomModel(m, false)"
+                              :disabled="customModelDeleteBusy[(m.provider || 'openrouter') + ':' + m.model] || customModelDeleteBusy['force:' + (m.provider || 'openrouter') + ':' + m.model]">
+                              Remove
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    </template>
+                  </tbody>
+                </table>
+              </div>
+              <div class="empty-state" x-show="!filteredCustomModels.length">
+                <h4>No custom OpenRouter models yet</h4>
+                <p class="hint">Paste a model ID above to add one. Saving unverified models is allowed.</p>
+              </div>
+            </div>
+
+            <div class="card-header" style="margin-bottom:8px">Curated Catalog</div>
             <div class="flex gap-2 mb-4" style="flex-wrap:wrap">
               <div class="search-input" style="flex:1;min-width:200px">
                 <span style="color:var(--text-muted)"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg></span>
@@ -2962,6 +3076,10 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
                   </template>
                 </tbody>
               </table>
+            </div>
+            <div class="empty-state" x-show="!filteredModels.length">
+              <h4>No curated models match current filters</h4>
+              <p class="hint">Clear search/provider/tier filters to see more catalog entries.</p>
             </div>
           </div>
 
