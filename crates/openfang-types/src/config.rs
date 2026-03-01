@@ -303,6 +303,28 @@ impl Default for BrowserConfig {
     }
 }
 
+/// Configuration for the Scrapling web-scraping bridge.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScraperConfig {
+    /// Per-request timeout in seconds.
+    pub timeout_secs: u64,
+    /// Python executable path (e.g., "python3" on Unix, "python" on Windows).
+    pub python_path: String,
+}
+
+impl Default for ScraperConfig {
+    fn default() -> Self {
+        Self {
+            timeout_secs: 30,
+            python_path: if cfg!(windows) {
+                "python".to_string()
+            } else {
+                "python3".to_string()
+            },
+        }
+    }
+}
+
 /// Config hot-reload mode.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -386,6 +408,35 @@ pub struct FallbackProviderConfig {
     /// Base URL override (uses catalog default if None).
     #[serde(default)]
     pub base_url: Option<String>,
+}
+
+/// User-added custom model entry for provider catalogs.
+///
+/// Configurable in `config.toml` under `[[custom_models]]`:
+/// ```toml
+/// [[custom_models]]
+/// provider = "openrouter"
+/// model = "z-ai/glm-5"
+/// status = "verified"
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CustomModelConfig {
+    /// Provider name (currently `openrouter` for this flow).
+    pub provider: String,
+    /// Canonical raw model ID (no provider prefix).
+    pub model: String,
+    /// Optional user label shown in UI.
+    #[serde(default)]
+    pub label: Option<String>,
+    /// Cached verification state: verified, unverified, or stale.
+    #[serde(default)]
+    pub status: String,
+    /// RFC3339 timestamp of the last successful verification.
+    #[serde(default)]
+    pub verified_at: Option<String>,
+    /// Optional short error from the last verification attempt.
+    #[serde(default)]
+    pub last_error: Option<String>,
 }
 
 /// Text-to-speech configuration.
@@ -971,9 +1022,16 @@ pub struct KernelConfig {
     /// Configure in config.toml as `[[fallback_providers]]`.
     #[serde(default)]
     pub fallback_providers: Vec<FallbackProviderConfig>,
+    /// User-added custom model metadata.
+    /// Configure in config.toml as `[[custom_models]]`.
+    #[serde(default)]
+    pub custom_models: Vec<CustomModelConfig>,
     /// Browser automation configuration.
     #[serde(default)]
     pub browser: BrowserConfig,
+    /// Scrapling web-scraping bridge configuration.
+    #[serde(default)]
+    pub scraper: ScraperConfig,
     /// Extensions & integrations configuration.
     #[serde(default)]
     pub extensions: ExtensionsConfig,
@@ -1174,7 +1232,7 @@ impl Default for KernelConfig {
             data_dir: home_dir.join("data"),
             home_dir,
             log_level: "info".to_string(),
-            api_listen: "127.0.0.1:50051".to_string(),
+            api_listen: "127.0.0.1:4200".to_string(),
             network_enabled: false,
             default_model: DefaultModelConfig::default(),
             memory: MemoryConfig::default(),
@@ -1189,7 +1247,9 @@ impl Default for KernelConfig {
             usage_footer: UsageFooterMode::default(),
             web: WebConfig::default(),
             fallback_providers: Vec::new(),
+            custom_models: Vec::new(),
             browser: BrowserConfig::default(),
+            scraper: ScraperConfig::default(),
             extensions: ExtensionsConfig::default(),
             vault: VaultConfig::default(),
             workspaces_dir: None,
@@ -1261,6 +1321,7 @@ impl std::fmt::Debug for KernelConfig {
                 "fallback_providers",
                 &format!("{} provider(s)", self.fallback_providers.len()),
             )
+            .field("custom_models", &format!("{} model(s)", self.custom_models.len()))
             .field("browser", &self.browser)
             .field("extensions", &self.extensions)
             .field("vault", &format!("enabled={}", self.vault.enabled))
@@ -3210,7 +3271,7 @@ mod tests {
     fn test_default_config() {
         let config = KernelConfig::default();
         assert_eq!(config.log_level, "info");
-        assert_eq!(config.api_listen, "127.0.0.1:50051");
+        assert_eq!(config.api_listen, "127.0.0.1:4200");
         assert!(!config.network_enabled);
     }
 
@@ -3510,6 +3571,23 @@ mod tests {
         assert_eq!(config.fallback_providers.len(), 2);
         assert_eq!(config.fallback_providers[0].provider, "ollama");
         assert_eq!(config.fallback_providers[1].provider, "groq");
+    }
+
+    #[test]
+    fn test_custom_models_in_toml() {
+        let toml_str = r#"
+            [[custom_models]]
+            provider = "openrouter"
+            model = "z-ai/glm-5"
+            label = "GLM 5"
+            status = "verified"
+            verified_at = "2026-03-01T00:00:00Z"
+        "#;
+        let config: KernelConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.custom_models.len(), 1);
+        assert_eq!(config.custom_models[0].provider, "openrouter");
+        assert_eq!(config.custom_models[0].model, "z-ai/glm-5");
+        assert_eq!(config.custom_models[0].status, "verified");
     }
 
     #[test]
