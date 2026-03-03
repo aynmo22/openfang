@@ -40,6 +40,11 @@ pub fn bundled_hands() -> Vec<(&'static str, &'static str, &'static str)> {
             include_str!("../bundled/browser/HAND.toml"),
             include_str!("../bundled/browser/SKILL.md"),
         ),
+        (
+            "forge",
+            include_str!("../bundled/forge/HAND.toml"),
+            include_str!("../bundled/forge/SKILL.md"),
+        ),
     ]
 }
 
@@ -71,7 +76,7 @@ mod tests {
     #[test]
     fn bundled_hands_count() {
         let hands = bundled_hands();
-        assert_eq!(hands.len(), 7);
+        assert_eq!(hands.len(), 8);
     }
 
     #[test]
@@ -199,6 +204,25 @@ mod tests {
         assert!(!def.dashboard.metrics.is_empty());
         assert!((def.agent.temperature - 0.3).abs() < f32::EPSILON);
         assert_eq!(def.agent.max_iterations, Some(60));
+    }
+
+    #[test]
+    fn parse_forge_hand() {
+        let (id, toml_content, skill_content) = bundled_hands()
+            .into_iter()
+            .find(|(id, _, _)| *id == "forge")
+            .unwrap();
+        let def = parse_bundled(id, toml_content, skill_content).unwrap();
+        assert_eq!(def.id, "forge");
+        assert_eq!(def.name, "Forge");
+        assert_eq!(def.category, crate::HandCategory::Development);
+        assert!(def.skill_content.is_some());
+        assert!(def.tools.contains(&"file_write".to_string()));
+        assert!(def.tools.contains(&"shell_exec".to_string()));
+        assert!(!def.settings.is_empty());
+        assert!(!def.dashboard.metrics.is_empty());
+        assert!((def.agent.temperature - 0.3).abs() < f32::EPSILON);
+        assert_eq!(def.agent.max_iterations, Some(50));
     }
 
     #[test]
