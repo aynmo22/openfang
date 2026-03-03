@@ -152,7 +152,7 @@ Standard structure:
 |----------|-----------|----------|
 | `deepseek/deepseek-chat` | Fast, precise, strong coder | Code generation, TOML, configs |
 | `minimax/minimax-01` | Long context, reasoning | Complex multi-step tasks |
-| `thudm/glm-4` | Balanced, multilingual | General purpose |
+| `z-ai/glm-5` | Balanced, multilingual | General purpose |
 | `moonshot/moonshot-v1-128k` | 128K context | Long-form writing |
 
 ## Known Pitfalls

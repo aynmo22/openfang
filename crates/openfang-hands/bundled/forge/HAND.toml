@@ -26,8 +26,8 @@ value = "minimax/minimax-01"
 label = "MiniMax M2.5 (reasoning)"
 
 [[settings.options]]
-value = "thudm/glm-4"
-label = "GLM-4 (balanced)"
+value = "z-ai/glm-5"
+label = "GLM-5 (balanced)"
 
 [[settings]]
 key = "scaffold_output_dir"
