@@ -1,0 +1,83 @@
+# ============================================================================
+# FORGE — The Builder's Scaffolding Hand
+# ============================================================================
+
+[hand]
+id = "forge"
+name = "Forge"
+description = "Personal builder's scaffolding agent. Generates OpenFang Hands, MCP servers, and Python pipelines from natural language descriptions. Review in dashboard, deploy with one click."
+category = "Developer Tools"
+icon = "hammer"
+version = "1.0.0"
+
+# ── TOOLS & CAPABILITIES ────────────────────────────────────────────────────
+# Only the tools Forge actually needs. Principle of least privilege.
+
+[hand.requires]
+tools = [
+    "file_read",
+    "file_write",
+    "file_list",
+    "file_delete",
+    "shell_exec",
+    "web_fetch",
+    "memory_read",
+    "memory_write",
+    "agent_send"
+]
+
+# ── USER-CONFIGURABLE SETTINGS ──────────────────────────────────────────────
+# These show up as tunable knobs in the OpenFang dashboard.
+
+[hand.settings]
+scaffold_type = { type = "string", default = "hand", options = ["hand", "mcp", "pipeline"], description = "Default scaffold type when not specified" }
+scaffold_output_dir = { type = "string", default = "~/.openfang/forge/staging", description = "Where Forge writes scaffolded files for review" }
+production_hands_dir = { type = "string", default = "~/.openfang/hands", description = "Where approved Hands get deployed" }
+production_mcp_dir = { type = "string", default = "~/mcp-servers", description = "Where approved MCP servers get deployed" }
+production_pipelines_dir = { type = "string", default = "~/pipelines", description = "Where approved Python pipelines get deployed" }
+default_model_provider = { type = "string", default = "openrouter", description = "Default LLM provider for generated scaffolds" }
+default_model = { type = "string", default = "deepseek/deepseek-chat", options = ["deepseek/deepseek-chat", "minimax/minimax-01", "moonshot/moonshot-v1-128k", "thudm/glm-4"], description = "Default model for generated scaffolds" }
+auto_validate = { type = "bool", default = true, description = "Auto-run TOML validation and Python linting before staging" }
+learn_from_deploys = { type = "bool", default = true, description = "Index deployed scaffolds to improve future generation" }
+
+# ── LLM CONFIGURATION ───────────────────────────────────────────────────────
+# DeepSeek V3.2 via OpenRouter — fast, cheap, strong at structured output.
+
+[hand.agent]
+model = "deepseek/deepseek-chat"
+temperature = 0.3
+max_iterations = 50
+
+# ── SCHEDULE ─────────────────────────────────────────────────────────────────
+# Primarily on-demand (triggered via Slack or dashboard chat).
+# The daily 7AM run is for maintenance: index new patterns, validate staging,
+# clean up stale scaffolds, report what's pending review.
+
+[hand.schedule]
+cron = "0 7 * * *"
+
+# ── DASHBOARD METRICS ────────────────────────────────────────────────────────
+
+[hand.dashboard]
+metrics = [
+    "scaffolds_generated",
+    "scaffolds_deployed",
+    "scaffolds_rejected",
+    "avg_generation_time_seconds",
+    "patterns_learned",
+    "tokens_consumed"
+]
+
+# ── EVENT TRIGGERS ───────────────────────────────────────────────────────────
+# Forge can also be triggered by Slack messages matching a pattern.
+# This enables the /forge slash command workflow.
+
+[hand.triggers]
+# Webhook or event triggers can be configured here once Slack adapter is wired
+
+# ── MULTI-HAND ORCHESTRATION ────────────────────────────────────────────────
+# Forge can chain into other Hands. For example, after scaffolding a new
+# Collector Hand, it could auto-activate it. Leaving empty for now —
+# you control what gets activated.
+
+[hand.chain]

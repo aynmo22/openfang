@@ -3097,7 +3097,7 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
                           <span class="badge" :class="modelStatusBadgeClass(m.runtime_status || m.status)" x-text="modelStatusText(m.runtime_status || m.status)"></span>
                         </td>
                         <td class="text-xs" x-text="formatVerifiedAt(m.verified_at)"></td>
-                        <td class="text-xs text-dim" x-text="m.last_error || '-'"></td>
+                        <td class="text-xs text-dim" x-text="(m.runtime_status || m.status) === 'verified' ? '-' : (m.last_error || '-')"></td>
                         <td>
                           <div class="flex gap-1" style="flex-wrap:wrap">
                             <button class="btn btn-ghost btn-sm"

@@ -17,7 +17,7 @@ use crate::web_search::WebToolsContext;
 use openfang_memory::session::Session;
 use openfang_memory::MemorySubstrate;
 use openfang_skills::registry::SkillRegistry;
-use openfang_types::agent::AgentManifest;
+use openfang_types::agent::{AgentId, AgentManifest};
 use openfang_types::error::{OpenFangError, OpenFangResult};
 use openfang_types::memory::{Memory, MemoryFilter, MemorySource};
 use openfang_types::message::{
@@ -105,6 +105,131 @@ pub struct AgentLoopResult {
     pub directives: openfang_types::message::ReplyDirectives,
 }
 
+/// Extract structured facts from an agent interaction and store them as semantic memories.
+///
+/// Calls a cheap, fast model to pull out durable knowledge (names, preferences, decisions, etc.)
+/// as discrete facts, then embeds and stores each one in the `"semantic"` memory scope so
+/// future recall surfaces specific knowledge rather than raw turn text.
+///
+/// This is intentionally fire-and-forget: callers should wrap in `tokio::time::timeout`.
+async fn extract_and_store_facts(
+    user_message: &str,
+    agent_response: &str,
+    driver: &(dyn LlmDriver + Send + Sync),
+    memory: &MemorySubstrate,
+    agent_id: AgentId,
+    embedding_driver: Option<&(dyn EmbeddingDriver + Send + Sync)>,
+) {
+    // Skip trivially short exchanges — nothing durable to extract.
+    if user_message.len() + agent_response.len() < 120 {
+        return;
+    }
+
+    let prompt = format!(
+        "Extract durable facts from this conversation turn.\n\
+         Return ONLY a JSON array like: [{{\"fact\":\"...\",\"confidence\":0.9}}]\n\
+         Focus on: names, preferences, dates, decisions, relationships, skills, goals.\n\
+         Skip greetings, filler, and purely transient exchanges.\n\n\
+         User: {user_message}\nAssistant: {agent_response}\n\nJSON facts:"
+    );
+
+    let request = CompletionRequest {
+        model: "deepseek/deepseek-v3".to_string(),
+        messages: vec![Message::user(&prompt)],
+        tools: vec![],
+        max_tokens: 512,
+        temperature: 0.0,
+        system: Some(
+            "You are a fact extraction engine. Output only valid JSON, no explanation.".to_string(),
+        ),
+        thinking: None,
+    };
+
+    let response = match driver.complete(request).await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("Fact extraction LLM call failed: {e}");
+            return;
+        }
+    };
+
+    let raw = response.text();
+
+    // Locate the JSON array bounds — model may prefix/suffix with prose.
+    let json_str = if let (Some(start), Some(end)) = (raw.find('['), raw.rfind(']')) {
+        &raw[start..=end]
+    } else {
+        warn!("Fact extraction: no JSON array found in response");
+        return;
+    };
+
+    #[derive(serde::Deserialize)]
+    struct RawFact {
+        fact: String,
+        #[allow(dead_code)]
+        confidence: Option<f32>,
+    }
+
+    let facts: Vec<RawFact> = match serde_json::from_str(json_str) {
+        Ok(f) => f,
+        Err(e) => {
+            warn!("Fact extraction JSON parse error: {e}");
+            return;
+        }
+    };
+
+    if facts.is_empty() {
+        return;
+    }
+
+    for item in &facts {
+        let fact = item.fact.trim();
+        if fact.is_empty() {
+            continue;
+        }
+        if let Some(emb) = embedding_driver {
+            match emb.embed_one(fact).await {
+                Ok(vec) => {
+                    let _ = memory
+                        .remember_with_embedding_async(
+                            agent_id,
+                            fact,
+                            MemorySource::Conversation,
+                            "semantic",
+                            HashMap::new(),
+                            Some(&vec),
+                        )
+                        .await;
+                }
+                Err(e) => {
+                    warn!("Fact embed failed: {e}");
+                    let _ = memory
+                        .remember(
+                            agent_id,
+                            fact,
+                            MemorySource::Conversation,
+                            "semantic",
+                            HashMap::new(),
+                        )
+                        .await;
+                }
+            }
+        } else {
+            let _ = memory
+                .remember(
+                    agent_id,
+                    fact,
+                    MemorySource::Conversation,
+                    "semantic",
+                    HashMap::new(),
+                )
+                .await;
+        }
+    }
+
+    info!(count = facts.len(), "Extracted and stored semantic facts");
+}
+
 /// Run the agent execution loop for a single user message.
 ///
 /// This is the core of OpenFang: it loads session context, recalls memories,
@@ -122,6 +247,7 @@ pub async fn run_agent_loop(
     mcp_connections: Option<&tokio::sync::Mutex<Vec<McpConnection>>>,
     web_ctx: Option<&WebToolsContext>,
     browser_ctx: Option<&crate::browser::BrowserManager>,
+    scraper_ctx: Option<&crate::scraper::ScraperManager>,
     embedding_driver: Option<&(dyn EmbeddingDriver + Send + Sync)>,
     workspace_root: Option<&Path>,
     on_phase: Option<&PhaseCallback>,
@@ -464,6 +590,20 @@ pub async fn run_agent_loop(
                         .await;
                 }
 
+                // Extract and store semantic facts (best-effort, 8 s hard timeout).
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(8),
+                    extract_and_store_facts(
+                        user_message,
+                        &final_response,
+                        driver.as_ref(),
+                        memory,
+                        session.agent_id,
+                        embedding_driver,
+                    ),
+                )
+                .await;
+
                 // Notify phase: Done
                 if let Some(cb) = on_phase {
                     cb(LoopPhase::Done);
@@ -619,6 +759,7 @@ pub async fn run_agent_loop(
                             mcp_connections,
                             web_ctx,
                             browser_ctx,
+                            scraper_ctx,
                             if hand_allowed_env.is_empty() {
                                 None
                             } else {
@@ -1021,6 +1162,7 @@ pub async fn run_agent_loop_streaming(
     mcp_connections: Option<&tokio::sync::Mutex<Vec<McpConnection>>>,
     web_ctx: Option<&WebToolsContext>,
     browser_ctx: Option<&crate::browser::BrowserManager>,
+    scraper_ctx: Option<&crate::scraper::ScraperManager>,
     embedding_driver: Option<&(dyn EmbeddingDriver + Send + Sync)>,
     workspace_root: Option<&Path>,
     on_phase: Option<&PhaseCallback>,
@@ -1377,6 +1519,20 @@ pub async fn run_agent_loop_streaming(
                         .await;
                 }
 
+                // Extract and store semantic facts (best-effort, 8 s hard timeout).
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(8),
+                    extract_and_store_facts(
+                        user_message,
+                        &final_response,
+                        driver.as_ref(),
+                        memory,
+                        session.agent_id,
+                        embedding_driver,
+                    ),
+                )
+                .await;
+
                 // Notify phase: Done
                 if let Some(cb) = on_phase {
                     cb(LoopPhase::Done);
@@ -1528,6 +1684,7 @@ pub async fn run_agent_loop_streaming(
                             mcp_connections,
                             web_ctx,
                             browser_ctx,
+                            scraper_ctx,
                             if hand_allowed_env.is_empty() {
                                 None
                             } else {
@@ -2039,6 +2196,7 @@ mod tests {
             None,
             None,
             None,
+            None, // scraper_ctx
             None, // on_phase
             None, // media_engine
             None, // tts_engine
@@ -2091,6 +2249,7 @@ mod tests {
             None,
             None,
             None,
+            None, // scraper_ctx
             None, // on_phase
             None, // media_engine
             None, // tts_engine
@@ -2143,6 +2302,7 @@ mod tests {
             None,
             None,
             None,
+            None, // scraper_ctx
             None, // on_phase
             None, // media_engine
             None, // tts_engine
@@ -2188,6 +2348,7 @@ mod tests {
             None,
             None,
             None,
+            None, // scraper_ctx
             None, // on_phase
             None, // media_engine
             None, // tts_engine
@@ -2315,6 +2476,7 @@ mod tests {
             None,
             None,
             None,
+            None, // scraper_ctx
             None, // context_window_tokens
             None, // process_manager
         )
@@ -2361,6 +2523,7 @@ mod tests {
             None,
             None,
             None,
+            None, // scraper_ctx
             None, // context_window_tokens
             None, // process_manager
         )
@@ -2410,6 +2573,7 @@ mod tests {
             None,
             None,
             None,
+            None, // scraper_ctx
             None, // on_phase
             None, // media_engine
             None, // tts_engine
@@ -2780,6 +2944,7 @@ mod tests {
             None,
             None,
             None,
+            None, // scraper_ctx
             None, // on_phase
             None, // media_engine
             None, // tts_engine
@@ -2853,6 +3018,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect("Normal loop should complete");
@@ -2908,6 +3074,7 @@ mod tests {
             None,
             None,
             None,
+            None, // scraper_ctx
             None, // on_phase
             None, // media_engine
             None, // tts_engine

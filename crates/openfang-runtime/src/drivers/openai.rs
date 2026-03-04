@@ -16,15 +16,20 @@ pub struct OpenAIDriver {
     api_key: Zeroizing<String>,
     base_url: String,
     client: reqwest::Client,
+    /// Whether this driver is targeting OpenRouter specifically.
+    /// Enables OpenRouter-only request fields: `data_collection` and prompt caching.
+    is_openrouter: bool,
 }
 
 impl OpenAIDriver {
     /// Create a new OpenAI-compatible driver.
     pub fn new(api_key: String, base_url: String) -> Self {
+        let is_openrouter = base_url.contains("openrouter.ai");
         Self {
             api_key: Zeroizing::new(api_key),
             base_url,
             client: reqwest::Client::new(),
+            is_openrouter,
         }
     }
 }
@@ -46,6 +51,18 @@ struct OaiRequest {
     tool_choice: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     stream: bool,
+    /// OpenRouter-only: prevents request data from being used for model training.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data_collection: Option<String>,
+}
+
+/// OpenRouter prompt caching marker.
+/// Adding this to a content part tells OpenRouter to cache everything up to
+/// and including this part. Cache reads cost 0.25× normal input price.
+#[derive(Debug, Serialize)]
+struct OaiCacheControl {
+    #[serde(rename = "type")]
+    cache_type: String,
 }
 
 /// Returns true if a model uses `max_completion_tokens` instead of `max_tokens`.
@@ -82,7 +99,12 @@ enum OaiMessageContent {
 #[serde(tag = "type")]
 enum OaiContentPart {
     #[serde(rename = "text")]
-    Text { text: String },
+    Text {
+        text: String,
+        /// OpenRouter prompt caching: present on the last part of a cacheable block.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<OaiCacheControl>,
+    },
     #[serde(rename = "image_url")]
     ImageUrl { image_url: OaiImageUrl },
 }
@@ -149,11 +171,23 @@ impl LlmDriver for OpenAIDriver {
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, LlmError> {
         let mut oai_messages: Vec<OaiMessage> = Vec::new();
 
-        // Add system message if present
+        // Add system message if present.
+        // On OpenRouter, wrap as Parts with cache_control so the system prompt is cached —
+        // cache reads cost 0.25× input price, yielding ~75% savings on repeated turns.
         if let Some(ref system) = request.system {
+            let system_content = if self.is_openrouter {
+                OaiMessageContent::Parts(vec![OaiContentPart::Text {
+                    text: system.clone(),
+                    cache_control: Some(OaiCacheControl {
+                        cache_type: "ephemeral".to_string(),
+                    }),
+                }])
+            } else {
+                OaiMessageContent::Text(system.clone())
+            };
             oai_messages.push(OaiMessage {
                 role: "system".to_string(),
-                content: Some(OaiMessageContent::Text(system.clone())),
+                content: Some(system_content),
                 tool_calls: None,
                 tool_call_id: None,
             });
@@ -164,9 +198,19 @@ impl LlmDriver for OpenAIDriver {
             match (&msg.role, &msg.content) {
                 (Role::System, MessageContent::Text(text)) => {
                     if request.system.is_none() {
+                        let system_content = if self.is_openrouter {
+                            OaiMessageContent::Parts(vec![OaiContentPart::Text {
+                                text: text.clone(),
+                                cache_control: Some(OaiCacheControl {
+                                    cache_type: "ephemeral".to_string(),
+                                }),
+                            }])
+                        } else {
+                            OaiMessageContent::Text(text.clone())
+                        };
                         oai_messages.push(OaiMessage {
                             role: "system".to_string(),
-                            content: Some(OaiMessageContent::Text(text.clone())),
+                            content: Some(system_content),
                             tool_calls: None,
                             tool_call_id: None,
                         });
@@ -208,7 +252,10 @@ impl LlmDriver for OpenAIDriver {
                                 });
                             }
                             ContentBlock::Text { text } => {
-                                parts.push(OaiContentPart::Text { text: text.clone() });
+                                parts.push(OaiContentPart::Text {
+                                    text: text.clone(),
+                                    cache_control: None,
+                                });
                             }
                             ContentBlock::Image { media_type, data } => {
                                 parts.push(OaiContentPart::ImageUrl {
@@ -305,6 +352,11 @@ impl LlmDriver for OpenAIDriver {
             tools: oai_tools,
             tool_choice,
             stream: false,
+            data_collection: if self.is_openrouter {
+                Some("deny".to_string())
+            } else {
+                None
+            },
         };
 
         let max_retries = 3;
@@ -477,9 +529,19 @@ impl LlmDriver for OpenAIDriver {
         let mut oai_messages: Vec<OaiMessage> = Vec::new();
 
         if let Some(ref system) = request.system {
+            let system_content = if self.is_openrouter {
+                OaiMessageContent::Parts(vec![OaiContentPart::Text {
+                    text: system.clone(),
+                    cache_control: Some(OaiCacheControl {
+                        cache_type: "ephemeral".to_string(),
+                    }),
+                }])
+            } else {
+                OaiMessageContent::Text(system.clone())
+            };
             oai_messages.push(OaiMessage {
                 role: "system".to_string(),
-                content: Some(OaiMessageContent::Text(system.clone())),
+                content: Some(system_content),
                 tool_calls: None,
                 tool_call_id: None,
             });
@@ -489,9 +551,19 @@ impl LlmDriver for OpenAIDriver {
             match (&msg.role, &msg.content) {
                 (Role::System, MessageContent::Text(text)) => {
                     if request.system.is_none() {
+                        let system_content = if self.is_openrouter {
+                            OaiMessageContent::Parts(vec![OaiContentPart::Text {
+                                text: text.clone(),
+                                cache_control: Some(OaiCacheControl {
+                                    cache_type: "ephemeral".to_string(),
+                                }),
+                            }])
+                        } else {
+                            OaiMessageContent::Text(text.clone())
+                        };
                         oai_messages.push(OaiMessage {
                             role: "system".to_string(),
-                            content: Some(OaiMessageContent::Text(text.clone())),
+                            content: Some(system_content),
                             tool_calls: None,
                             tool_call_id: None,
                         });
@@ -605,6 +677,11 @@ impl LlmDriver for OpenAIDriver {
             tools: oai_tools,
             tool_choice,
             stream: true,
+            data_collection: if self.is_openrouter {
+                Some("deny".to_string())
+            } else {
+                None
+            },
         };
 
         // Retry loop for the initial HTTP request

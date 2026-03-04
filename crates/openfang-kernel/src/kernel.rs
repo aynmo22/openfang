@@ -105,6 +105,8 @@ pub struct OpenFangKernel {
     pub web_ctx: openfang_runtime::web_search::WebToolsContext,
     /// Browser automation manager (Playwright bridge sessions).
     pub browser_ctx: openfang_runtime::browser::BrowserManager,
+    /// Web scraping manager (Scrapling stealth + dynamic fetcher).
+    pub scraper_ctx: openfang_runtime::scraper::ScraperManager,
     /// Media understanding engine (image description, audio transcription).
     pub media_engine: openfang_runtime::media_understanding::MediaEngine,
     /// Text-to-speech engine.
@@ -757,9 +759,10 @@ impl OpenFangKernel {
             if let Some(ref provider) = config.memory.embedding_provider {
                 // Explicit config takes priority
                 let api_key_env = config.memory.embedding_api_key_env.as_deref().unwrap_or("");
-                match create_embedding_driver(provider, "text-embedding-3-small", api_key_env) {
+                let model = config.memory.embedding_model.as_str();
+                match create_embedding_driver(provider, model, api_key_env) {
                     Ok(d) => {
-                        info!(provider = %provider, "Embedding driver configured from memory config");
+                        info!(provider = %provider, model = %model, "Embedding driver configured from memory config");
                         Some(Arc::from(d))
                     }
                     Err(e) => {
@@ -795,6 +798,7 @@ impl OpenFangKernel {
         };
 
         let browser_ctx = openfang_runtime::browser::BrowserManager::new(config.browser.clone());
+        let scraper_ctx = openfang_runtime::scraper::ScraperManager::new(config.scraper.clone());
 
         // Initialize media understanding engine
         let media_engine =
@@ -903,6 +907,7 @@ impl OpenFangKernel {
             a2a_external_agents: std::sync::Mutex::new(Vec::new()),
             web_ctx,
             browser_ctx,
+            scraper_ctx,
             media_engine,
             tts_engine,
             pairing,
@@ -1694,6 +1699,7 @@ impl OpenFangKernel {
                 Some(&kernel_clone.mcp_connections),
                 Some(&kernel_clone.web_ctx),
                 Some(&kernel_clone.browser_ctx),
+                Some(&kernel_clone.scraper_ctx),
                 kernel_clone.embedding_driver.as_deref(),
                 manifest.workspace.as_deref(),
                 Some(&phase_cb),
@@ -2174,6 +2180,7 @@ impl OpenFangKernel {
             Some(&self.mcp_connections),
             Some(&self.web_ctx),
             Some(&self.browser_ctx),
+            Some(&self.scraper_ctx),
             self.embedding_driver.as_deref(),
             manifest.workspace.as_deref(),
             None, // on_phase callback

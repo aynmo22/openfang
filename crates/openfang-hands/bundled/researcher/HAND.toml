@@ -3,7 +3,7 @@ name = "Researcher Hand"
 description = "Autonomous deep researcher — exhaustive investigation, cross-referencing, fact-checking, and structured reports"
 category = "productivity"
 icon = "\U0001F9EA"
-tools = ["shell_exec", "file_read", "file_write", "file_list", "web_fetch", "web_search", "memory_store", "memory_recall", "schedule_create", "schedule_list", "schedule_delete", "knowledge_add_entity", "knowledge_add_relation", "knowledge_query", "event_publish"]
+tools = ["shell_exec", "file_read", "file_write", "file_list", "web_fetch", "web_search", "scrape_url", "scrape_dynamic", "memory_store", "memory_recall", "schedule_create", "schedule_list", "schedule_delete", "knowledge_add_entity", "knowledge_add_relation", "knowledge_query", "event_publish"]
 
 # ─── Configurable settings ───────────────────────────────────────────────────
 
@@ -217,7 +217,11 @@ If `language` is not English, also search in the target language.
 For each search query:
 1. web_search → collect results
 2. Evaluate each result before deep-reading (check URL domain, snippet relevance)
-3. web_fetch promising sources → extract:
+3. Fetch promising sources using the best tool for the job:
+   - **web_fetch** — default for standard pages
+   - **scrape_url** — use when web_fetch is blocked, returns a bot-detection error, or the source is known to use Cloudflare/aggressive anti-bot. Uses stealth HTTP headers.
+   - **scrape_dynamic** — use for JavaScript-rendered pages where content only appears after JS execution (e.g., React SPAs, infinite-scroll feeds, pages that load data via XHR). Optionally pass `wait_for` as a CSS selector to wait for a specific element before extracting.
+4. From each fetched page, extract:
    - Key claims and assertions
    - Data points and statistics
    - Expert quotes and opinions

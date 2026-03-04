@@ -50,6 +50,10 @@ pub async fn build_router(
         channels_config: tokio::sync::RwLock::new(channels_config),
         shutdown_notify: Arc::new(tokio::sync::Notify::new()),
         clawhub_cache: dashmap::DashMap::new(),
+        openrouter_catalog_cache: tokio::sync::RwLock::new(None),
+        model_warnings: tokio::sync::RwLock::new(Vec::new()),
+        config_write_lock: tokio::sync::Mutex::new(()),
+        last_config_write_fingerprint: tokio::sync::RwLock::new(None),
     });
 
     // CORS: allow localhost origins by default. If API key is set, the API

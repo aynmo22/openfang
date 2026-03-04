@@ -47,8 +47,9 @@ pub struct ClawHubStats {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClawHubVersionInfo {
+    /// `null` defensively handled — some ClawHub entries omit this.
     #[serde(default)]
-    pub version: String,
+    pub version: Option<String>,
     #[serde(default)]
     pub created_at: i64,
     #[serde(default)]
@@ -112,6 +113,8 @@ pub struct ClawHubBrowseResponse {
 /// A skill entry from the search endpoint (`GET /api/v1/search`).
 ///
 /// Search results are much flatter than browse results.
+/// NOTE: `version` is `Option<String>` because the ClawHub API returns
+/// `null` for skills that have no explicit version tag.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClawHubSearchEntry {
@@ -122,8 +125,9 @@ pub struct ClawHubSearchEntry {
     pub display_name: String,
     #[serde(default)]
     pub summary: String,
+    /// `null` on ClawHub for skills without an explicit version tag.
     #[serde(default)]
-    pub version: String,
+    pub version: Option<String>,
     /// Unix ms timestamp.
     #[serde(default)]
     pub updated_at: i64,
@@ -368,7 +372,8 @@ impl ClawHubClient {
         entry
             .latest_version
             .as_ref()
-            .map(|v| v.version.as_str())
+            // version is Option<String> — use and_then to flatten Option<Option<&str>>
+            .and_then(|v| v.version.as_deref())
             .or_else(|| entry.tags.get("latest").map(|s| s.as_str()))
             .unwrap_or("")
     }
@@ -656,7 +661,7 @@ mod tests {
         assert_eq!(entry.stats.downloads, 19736);
         assert_eq!(entry.stats.stars, 15);
         assert_eq!(entry.tags.get("latest").unwrap(), "1.0.0");
-        assert_eq!(entry.latest_version.as_ref().unwrap().version, "1.0.0");
+        assert_eq!(entry.latest_version.as_ref().unwrap().version.as_deref(), Some("1.0.0"));
         assert_eq!(entry.updated_at, 1771777535889);
     }
 
@@ -698,7 +703,7 @@ mod tests {
         assert_eq!(entry.slug, "github");
         assert_eq!(entry.display_name, "Github");
         assert!(entry.score > 3.0);
-        assert_eq!(entry.version, "1.0.0");
+        assert_eq!(entry.version.as_deref(), Some("1.0.0"));
         assert_eq!(entry.updated_at, 1771777539580);
     }
 
@@ -760,7 +765,7 @@ mod tests {
         assert_eq!(detail.skill.display_name, "Github");
         assert_eq!(detail.skill.stats.downloads, 23790);
         assert_eq!(detail.skill.stats.stars, 67);
-        assert_eq!(detail.latest_version.as_ref().unwrap().version, "1.0.0");
+        assert_eq!(detail.latest_version.as_ref().unwrap().version.as_deref(), Some("1.0.0"));
         assert_eq!(detail.owner.as_ref().unwrap().handle, "steipete");
         assert!(detail.moderation.is_none());
     }
@@ -814,7 +819,7 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             latest_version: Some(ClawHubVersionInfo {
-                version: "2.0.0".to_string(),
+                version: Some("2.0.0".to_string()),
                 created_at: 0,
                 changelog: String::new(),
             }),

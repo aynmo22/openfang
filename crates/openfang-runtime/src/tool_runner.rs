@@ -109,6 +109,7 @@ pub async fn execute_tool(
     mcp_connections: Option<&tokio::sync::Mutex<Vec<mcp::McpConnection>>>,
     web_ctx: Option<&WebToolsContext>,
     browser_ctx: Option<&crate::browser::BrowserManager>,
+    scraper_ctx: Option<&crate::scraper::ScraperManager>,
     allowed_env_vars: Option<&[String]>,
     workspace_root: Option<&Path>,
     media_engine: Option<&crate::media_understanding::MediaEngine>,
@@ -404,6 +405,16 @@ pub async fn execute_tool(
                 crate::browser::tool_browser_back(input, mgr, aid).await
             }
             None => Err("Browser tools not available. Ensure Chrome/Chromium is installed.".to_string()),
+        },
+
+        // Scrapling web-scraping tools
+        "scrape_url" => match scraper_ctx {
+            Some(mgr) => crate::scraper::tool_scrape_url(input, mgr).await,
+            None => Err("Scraper tools not available.".to_string()),
+        },
+        "scrape_dynamic" => match scraper_ctx {
+            Some(mgr) => crate::scraper::tool_scrape_dynamic(input, mgr).await,
+            None => Err("Scraper tools not available.".to_string()),
         },
 
         // Canvas / A2UI tool
@@ -866,6 +877,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "properties": {}
             }),
         },
+        // --- Browser tools (upstream) ---
         ToolDefinition {
             name: "browser_scroll".to_string(),
             description: "Scroll the browser page. Use this to see content below the fold or navigate long pages.".to_string(),
@@ -906,6 +918,30 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {}
+            }),
+        },
+        // --- Scrapling web-scraping tools (custom) ---
+        ToolDefinition {
+            name: "scrape_url".to_string(),
+            description: "Fetch a web page using stealth HTTP headers to bypass basic anti-bot protection. Returns the page content as cleaned markdown. Faster than scrape_dynamic — use this first, fall back to scrape_dynamic if the page blocks simple requests or requires JavaScript rendering.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "url": { "type": "string", "description": "The URL to fetch (https:// only)" }
+                },
+                "required": ["url"]
+            }),
+        },
+        ToolDefinition {
+            name: "scrape_dynamic".to_string(),
+            description: "Fetch a JavaScript-rendered web page using a full headless browser (Playwright). Use when scrape_url fails due to JS rendering, Cloudflare Turnstile, or lazy-loaded content. Slower than scrape_url. Requires Playwright installed: pip install scrapling && playwright install chromium".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "url": { "type": "string", "description": "The URL to fetch (https:// only)" },
+                    "wait_for": { "type": "string", "description": "Optional CSS selector to wait for before extracting content (e.g., '.product-list', '#results')" }
+                },
+                "required": ["url"]
             }),
         },
         // --- Media understanding tools ---
@@ -3170,6 +3206,7 @@ mod tests {
             None,
             None,
             None,
+            None, // scraper_ctx
             None, // media_engine
             None, // exec_policy
             None, // tts_engine
@@ -3195,6 +3232,7 @@ mod tests {
             None,
             None,
             None,
+            None, // scraper_ctx
             None, // media_engine
             None, // exec_policy
             None, // tts_engine
@@ -3221,6 +3259,7 @@ mod tests {
             None,
             None,
             None,
+            None, // scraper_ctx
             None, // media_engine
             None, // exec_policy
             None, // tts_engine
@@ -3247,6 +3286,7 @@ mod tests {
             None,
             None,
             None,
+            None, // scraper_ctx
             None, // media_engine
             None, // exec_policy
             None, // tts_engine
@@ -3273,6 +3313,7 @@ mod tests {
             None,
             None,
             None,
+            None, // scraper_ctx
             None, // media_engine
             None, // exec_policy
             None, // tts_engine
@@ -3299,6 +3340,7 @@ mod tests {
             None,
             None,
             None,
+            None, // scraper_ctx
             None, // media_engine
             None, // exec_policy
             None, // tts_engine
@@ -3325,6 +3367,7 @@ mod tests {
             None,
             None,
             None,
+            None, // scraper_ctx
             None, // media_engine
             None, // exec_policy
             None, // tts_engine
@@ -3352,6 +3395,7 @@ mod tests {
             None,
             None,
             None,
+            None, // scraper_ctx
             None, // media_engine
             None, // exec_policy
             None, // tts_engine
@@ -3379,6 +3423,7 @@ mod tests {
             None,
             None,
             None,
+            None, // scraper_ctx
             None, // media_engine
             None, // exec_policy
             None, // tts_engine
@@ -3546,6 +3591,7 @@ mod tests {
             None,
             None,
             None,
+            None, // scraper_ctx
             None, // media_engine
             None, // exec_policy
             None, // tts_engine
@@ -3591,6 +3637,7 @@ mod tests {
             None,
             None,
             None,
+            None, // scraper_ctx
             None, // media_engine
             None, // exec_policy
             None, // tts_engine
