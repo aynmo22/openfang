@@ -117,6 +117,7 @@ async fn test_full_daemon_lifecycle() {
         model_warnings: tokio::sync::RwLock::new(Vec::new()),
         openrouter_catalog_cache: tokio::sync::RwLock::new(None),
         shutdown_notify: Arc::new(tokio::sync::Notify::new()),
+        clawhub_cache: dashmap::DashMap::new(),
     });
 
     let app = Router::new()
@@ -244,6 +245,7 @@ async fn test_server_immediate_responsiveness() {
         model_warnings: tokio::sync::RwLock::new(Vec::new()),
         openrouter_catalog_cache: tokio::sync::RwLock::new(None),
         shutdown_notify: Arc::new(tokio::sync::Notify::new()),
+        clawhub_cache: dashmap::DashMap::new(),
     });
 
     let app = Router::new()

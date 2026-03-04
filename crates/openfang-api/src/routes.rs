@@ -14,11 +14,9 @@ use openfang_kernel::OpenFangKernel;
 use openfang_runtime::kernel_handle::KernelHandle;
 use openfang_runtime::tool_runner::builtin_tool_definitions;
 use openfang_types::agent::{AgentId, AgentIdentity, AgentManifest};
-use std::collections::{HashMap, HashSet};
-use std::hash::{Hash, Hasher};
-use std::io::Write;
+use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 /// Shared application state.
 ///
@@ -35,22 +33,9 @@ pub struct AppState {
     pub channels_config: tokio::sync::RwLock<openfang_types::config::ChannelsConfig>,
     /// Notify handle to trigger graceful HTTP server shutdown from the API.
     pub shutdown_notify: Arc<tokio::sync::Notify>,
-    /// Process-wide config writer lock (single-writer semantics).
-    pub config_write_lock: std::sync::Mutex<()>,
-    /// Fingerprint of the last successful in-process config write.
-    pub last_config_write_fingerprint: tokio::sync::RwLock<Option<u64>>,
-    /// Runtime warnings surfaced in `/api/models` (e.g. reload parse failures).
-    pub model_warnings: tokio::sync::RwLock<Vec<String>>,
-    /// Cached OpenRouter model IDs for custom-model verification.
-    pub openrouter_catalog_cache: tokio::sync::RwLock<Option<OpenRouterCatalogCache>>,
-}
-
-#[derive(Clone, Debug)]
-pub struct OpenRouterCatalogCache {
-    pub model_ids: HashSet<String>,
-    pub fetched_at: Instant,
-    pub etag: Option<String>,
-    pub last_error: Option<String>,
+    /// ClawHub response cache — prevents 429 rate limiting on rapid dashboard refreshes.
+    /// Maps cache key → (fetched_at, response_json) with 120s TTL.
+    pub clawhub_cache: DashMap<String, (Instant, serde_json::Value)>,
 }
 
 /// POST /api/agents — Spawn a new agent.
@@ -130,20 +115,63 @@ pub async fn spawn_agent(
 
 /// GET /api/agents — List all agents.
 pub async fn list_agents(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    // Snapshot catalog once for enrichment
+    let catalog = state.kernel.model_catalog.read().ok();
+    let dm = &state.kernel.config.default_model;
+
     let agents: Vec<serde_json::Value> = state
         .kernel
         .registry
         .list()
         .into_iter()
         .map(|e| {
+            // Resolve "default" provider/model to actual kernel defaults
+            let provider = if e.manifest.model.provider.is_empty()
+                || e.manifest.model.provider == "default"
+            {
+                dm.provider.as_str()
+            } else {
+                e.manifest.model.provider.as_str()
+            };
+            let model = if e.manifest.model.model.is_empty()
+                || e.manifest.model.model == "default"
+            {
+                dm.model.as_str()
+            } else {
+                e.manifest.model.model.as_str()
+            };
+
+            // Enrich from catalog
+            let (tier, auth_status) = catalog
+                .as_ref()
+                .map(|cat| {
+                    let tier = cat
+                        .find_model(model)
+                        .map(|m| format!("{:?}", m.tier).to_lowercase())
+                        .unwrap_or_else(|| "unknown".to_string());
+                    let auth = cat
+                        .get_provider(provider)
+                        .map(|p| format!("{:?}", p.auth_status).to_lowercase())
+                        .unwrap_or_else(|| "unknown".to_string());
+                    (tier, auth)
+                })
+                .unwrap_or(("unknown".to_string(), "unknown".to_string()));
+
+            let ready = matches!(e.state, openfang_types::agent::AgentState::Running)
+                && auth_status != "missing";
+
             serde_json::json!({
                 "id": e.id.to_string(),
                 "name": e.name,
                 "state": format!("{:?}", e.state),
                 "mode": e.mode,
                 "created_at": e.created_at.to_rfc3339(),
-                "model_provider": e.manifest.model.provider,
-                "model_name": e.manifest.model.model,
+                "last_active": e.last_active.to_rfc3339(),
+                "model_provider": provider,
+                "model_name": model,
+                "model_tier": tier,
+                "auth_status": auth_status,
+                "ready": ready,
                 "profile": e.manifest.profile,
                 "identity": {
                     "emoji": e.identity.emoji,
@@ -498,6 +526,10 @@ pub async fn status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         "default_provider": state.kernel.config.default_model.provider,
         "default_model": state.kernel.config.default_model.model,
         "uptime_seconds": uptime,
+        "api_listen": state.kernel.config.api_listen,
+        "home_dir": state.kernel.config.home_dir.display().to_string(),
+        "log_level": state.kernel.config.log_level,
+        "network_enabled": state.kernel.config.network_enabled,
         "agents": agents,
     }))
 }
@@ -1061,7 +1093,7 @@ pub async fn send_message_stream(
 // ---------------------------------------------------------------------------
 
 /// Field type for the channel configuration form.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 enum FieldType {
     Secret,
     Text,
@@ -1138,7 +1170,7 @@ const CHANNEL_REGISTRY: &[ChannelMeta] = &[
             ChannelField { key: "bot_token_env", label: "Bot Token", field_type: FieldType::Secret, env_var: Some("DISCORD_BOT_TOKEN"), required: true, placeholder: "MTIz...", advanced: false },
             ChannelField { key: "allowed_guilds", label: "Allowed Guild IDs", field_type: FieldType::List, env_var: None, required: false, placeholder: "123456789, 987654321", advanced: true },
             ChannelField { key: "default_agent", label: "Default Agent", field_type: FieldType::Text, env_var: None, required: false, placeholder: "assistant", advanced: true },
-            ChannelField { key: "intents", label: "Intents Bitmask", field_type: FieldType::Number, env_var: None, required: false, placeholder: "33280", advanced: true },
+            ChannelField { key: "intents", label: "Intents Bitmask", field_type: FieldType::Number, env_var: None, required: false, placeholder: "37376", advanced: true },
         ],
         setup_steps: &["Go to discord.com/developers/applications", "Create a bot and copy the token", "Paste it below"],
         config_template: "[channels.discord]\nbot_token_env = \"DISCORD_BOT_TOKEN\"",
@@ -1774,12 +1806,16 @@ fn is_channel_configured(config: &openfang_types::config::ChannelsConfig, name: 
 }
 
 /// Build a JSON field descriptor, checking env var presence but never exposing secrets.
-fn build_field_json(f: &ChannelField) -> serde_json::Value {
+/// For non-secret fields, includes the actual config value from `config_values` if available.
+fn build_field_json(
+    f: &ChannelField,
+    config_values: Option<&serde_json::Value>,
+) -> serde_json::Value {
     let has_value = f
         .env_var
         .map(|ev| std::env::var(ev).map(|v| !v.is_empty()).unwrap_or(false))
         .unwrap_or(false);
-    serde_json::json!({
+    let mut field = serde_json::json!({
         "key": f.key,
         "label": f.label,
         "type": f.field_type.as_str(),
@@ -1788,12 +1824,96 @@ fn build_field_json(f: &ChannelField) -> serde_json::Value {
         "has_value": has_value,
         "placeholder": f.placeholder,
         "advanced": f.advanced,
-    })
+    });
+    // For non-secret fields, include the actual saved config value so the
+    // dashboard can pre-populate forms when editing existing configs.
+    if f.env_var.is_none() {
+        if let Some(obj) = config_values.and_then(|v| v.as_object()) {
+            if let Some(val) = obj.get(f.key) {
+                // Convert arrays to comma-separated string for list fields
+                let display_val = if f.field_type == FieldType::List {
+                    if let Some(arr) = val.as_array() {
+                        serde_json::Value::String(
+                            arr.iter()
+                                .filter_map(|v| {
+                                    v.as_str()
+                                        .map(|s| s.to_string())
+                                        .or_else(|| Some(v.to_string()))
+                                })
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                        )
+                    } else {
+                        val.clone()
+                    }
+                } else {
+                    val.clone()
+                };
+                field["value"] = display_val;
+                if !val.is_null()
+                    && val.as_str().map(|s| !s.is_empty()).unwrap_or(true)
+                {
+                    field["has_value"] = serde_json::Value::Bool(true);
+                }
+            }
+        }
+    }
+    field
 }
 
 /// Find a channel definition by name.
 fn find_channel_meta(name: &str) -> Option<&'static ChannelMeta> {
     CHANNEL_REGISTRY.iter().find(|c| c.name == name)
+}
+
+/// Serialize a channel's config to a JSON Value for pre-populating dashboard forms.
+fn channel_config_values(
+    config: &openfang_types::config::ChannelsConfig,
+    name: &str,
+) -> Option<serde_json::Value> {
+    match name {
+        "telegram" => config.telegram.as_ref().and_then(|c| serde_json::to_value(c).ok()),
+        "discord" => config.discord.as_ref().and_then(|c| serde_json::to_value(c).ok()),
+        "slack" => config.slack.as_ref().and_then(|c| serde_json::to_value(c).ok()),
+        "whatsapp" => config.whatsapp.as_ref().and_then(|c| serde_json::to_value(c).ok()),
+        "signal" => config.signal.as_ref().and_then(|c| serde_json::to_value(c).ok()),
+        "matrix" => config.matrix.as_ref().and_then(|c| serde_json::to_value(c).ok()),
+        "email" => config.email.as_ref().and_then(|c| serde_json::to_value(c).ok()),
+        "teams" => config.teams.as_ref().and_then(|c| serde_json::to_value(c).ok()),
+        "mattermost" => config.mattermost.as_ref().and_then(|c| serde_json::to_value(c).ok()),
+        "irc" => config.irc.as_ref().and_then(|c| serde_json::to_value(c).ok()),
+        "google_chat" => config.google_chat.as_ref().and_then(|c| serde_json::to_value(c).ok()),
+        "twitch" => config.twitch.as_ref().and_then(|c| serde_json::to_value(c).ok()),
+        "rocketchat" => config.rocketchat.as_ref().and_then(|c| serde_json::to_value(c).ok()),
+        "zulip" => config.zulip.as_ref().and_then(|c| serde_json::to_value(c).ok()),
+        "xmpp" => config.xmpp.as_ref().and_then(|c| serde_json::to_value(c).ok()),
+        "line" => config.line.as_ref().and_then(|c| serde_json::to_value(c).ok()),
+        "viber" => config.viber.as_ref().and_then(|c| serde_json::to_value(c).ok()),
+        "messenger" => config.messenger.as_ref().and_then(|c| serde_json::to_value(c).ok()),
+        "reddit" => config.reddit.as_ref().and_then(|c| serde_json::to_value(c).ok()),
+        "mastodon" => config.mastodon.as_ref().and_then(|c| serde_json::to_value(c).ok()),
+        "bluesky" => config.bluesky.as_ref().and_then(|c| serde_json::to_value(c).ok()),
+        "feishu" => config.feishu.as_ref().and_then(|c| serde_json::to_value(c).ok()),
+        "revolt" => config.revolt.as_ref().and_then(|c| serde_json::to_value(c).ok()),
+        "nextcloud" => config.nextcloud.as_ref().and_then(|c| serde_json::to_value(c).ok()),
+        "guilded" => config.guilded.as_ref().and_then(|c| serde_json::to_value(c).ok()),
+        "keybase" => config.keybase.as_ref().and_then(|c| serde_json::to_value(c).ok()),
+        "threema" => config.threema.as_ref().and_then(|c| serde_json::to_value(c).ok()),
+        "nostr" => config.nostr.as_ref().and_then(|c| serde_json::to_value(c).ok()),
+        "webex" => config.webex.as_ref().and_then(|c| serde_json::to_value(c).ok()),
+        "pumble" => config.pumble.as_ref().and_then(|c| serde_json::to_value(c).ok()),
+        "flock" => config.flock.as_ref().and_then(|c| serde_json::to_value(c).ok()),
+        "twist" => config.twist.as_ref().and_then(|c| serde_json::to_value(c).ok()),
+        "mumble" => config.mumble.as_ref().and_then(|c| serde_json::to_value(c).ok()),
+        "dingtalk" => config.dingtalk.as_ref().and_then(|c| serde_json::to_value(c).ok()),
+        "discourse" => config.discourse.as_ref().and_then(|c| serde_json::to_value(c).ok()),
+        "gitter" => config.gitter.as_ref().and_then(|c| serde_json::to_value(c).ok()),
+        "ntfy" => config.ntfy.as_ref().and_then(|c| serde_json::to_value(c).ok()),
+        "gotify" => config.gotify.as_ref().and_then(|c| serde_json::to_value(c).ok()),
+        "webhook" => config.webhook.as_ref().and_then(|c| serde_json::to_value(c).ok()),
+        "linkedin" => config.linkedin.as_ref().and_then(|c| serde_json::to_value(c).ok()),
+        _ => None,
+    }
 }
 
 /// GET /api/channels — List all 40 channel adapters with status and field metadata.
@@ -1821,7 +1941,12 @@ pub async fn list_channels(State(state): State<Arc<AppState>>) -> impl IntoRespo
                     .unwrap_or(true)
             });
 
-        let fields: Vec<serde_json::Value> = meta.fields.iter().map(build_field_json).collect();
+        let config_vals = channel_config_values(&live_channels, meta.name);
+        let fields: Vec<serde_json::Value> = meta
+            .fields
+            .iter()
+            .map(|f| build_field_json(f, config_vals.as_ref()))
+            .collect();
 
         channels.push(serde_json::json!({
             "name": meta.name,
@@ -1876,7 +2001,8 @@ pub async fn configure_channel(
 
     let home = openfang_kernel::config::openfang_home();
     let secrets_path = home.join("secrets.env");
-    let mut config_fields: HashMap<String, String> = HashMap::new();
+    let config_path = home.join("config.toml");
+    let mut config_fields: HashMap<String, (String, FieldType)> = HashMap::new();
 
     for field_def in meta.fields {
         let value = fields
@@ -1899,30 +2025,20 @@ pub async fn configure_channel(
             unsafe {
                 std::env::set_var(env_var, value);
             }
+            // Also write the env var NAME to config.toml so the channel section
+            // is not empty and the kernel knows which env var to read.
+            config_fields.insert(
+                field_def.key.to_string(),
+                (env_var.to_string(), FieldType::Text),
+            );
         } else {
-            // Config field — collect for TOML write
-            config_fields.insert(field_def.key.to_string(), value.to_string());
+            // Config field — collect for TOML write with type info
+            config_fields.insert(field_def.key.to_string(), (value.to_string(), field_def.field_type));
         }
     }
 
-    // Write config.toml section (atomic)
-    let channel_name = name.clone();
-    if let Err(e) = mutate_config_table(&state, move |root| {
-        let channels_entry = root
-            .entry("channels".to_string())
-            .or_insert_with(|| toml::Value::Table(toml::value::Table::new()));
-        let channels_table = channels_entry
-            .as_table_mut()
-            .ok_or_else(|| "channels is not a table".to_string())?;
-        let mut ch_table = toml::value::Table::new();
-        for (k, v) in &config_fields {
-            ch_table.insert(k.clone(), toml::Value::String(v.clone()));
-        }
-        channels_table.insert(channel_name.clone(), toml::Value::Table(ch_table));
-        Ok(())
-    })
-    .await
-    {
+    // Write config.toml section
+    if let Err(e) = upsert_channel_config(&config_path, &name, &config_fields) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": format!("Failed to write config: {e}")})),
@@ -1980,6 +2096,7 @@ pub async fn remove_channel(
 
     let home = openfang_kernel::config::openfang_home();
     let secrets_path = home.join("secrets.env");
+    let config_path = home.join("config.toml");
 
     // Remove all secret env vars for this channel
     for field_def in meta.fields {
@@ -1992,19 +2109,8 @@ pub async fn remove_channel(
         }
     }
 
-    // Remove config section (atomic)
-    let channel_name = name.clone();
-    if let Err(e) = mutate_config_table(&state, move |root| {
-        if let Some(channels) = root
-            .get_mut("channels")
-            .and_then(|c| c.as_table_mut())
-        {
-            channels.remove(&channel_name);
-        }
-        Ok(())
-    })
-    .await
-    {
+    // Remove config section
+    if let Err(e) = remove_channel_config(&config_path, &name) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": format!("Failed to remove config: {e}")})),
@@ -2398,19 +2504,14 @@ pub async fn get_template(Path(name): Path<String>) -> impl IntoResponse {
 // ---------------------------------------------------------------------------
 
 /// GET /api/memory/agents/:id/kv — List KV pairs for an agent.
+///
+/// Note: memory_store tool writes to a shared namespace, so we read from that
+/// same namespace regardless of which agent ID is in the URL.
 pub async fn get_agent_kv(
     State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
+    Path(_id): Path<String>,
 ) -> impl IntoResponse {
-    let agent_id: AgentId = match id.parse() {
-        Ok(id) => id,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "Invalid agent ID"})),
-            );
-        }
-    };
+    let agent_id = openfang_kernel::kernel::shared_memory_agent_id();
 
     match state.kernel.memory.list_kv(agent_id) {
         Ok(pairs) => {
@@ -2421,7 +2522,7 @@ pub async fn get_agent_kv(
             (StatusCode::OK, Json(serde_json::json!({"kv_pairs": kv})))
         }
         Err(e) => {
-            tracing::warn!("Memory list_kv failed for agent {id}: {e}");
+            tracing::warn!("Memory list_kv failed: {e}");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "Memory operation failed"})),
@@ -2433,17 +2534,9 @@ pub async fn get_agent_kv(
 /// GET /api/memory/agents/:id/kv/:key — Get a specific KV value.
 pub async fn get_agent_kv_key(
     State(state): State<Arc<AppState>>,
-    Path((id, key)): Path<(String, String)>,
+    Path((_id, key)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    let agent_id: AgentId = match id.parse() {
-        Ok(id) => id,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "Invalid agent ID"})),
-            );
-        }
-    };
+    let agent_id = openfang_kernel::kernel::shared_memory_agent_id();
 
     match state.kernel.memory.structured_get(agent_id, &key) {
         Ok(Some(val)) => (
@@ -2455,7 +2548,7 @@ pub async fn get_agent_kv_key(
             Json(serde_json::json!({"error": "Key not found"})),
         ),
         Err(e) => {
-            tracing::warn!("Memory get failed for agent {id}, key '{key}': {e}");
+            tracing::warn!("Memory get failed for key '{key}': {e}");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "Memory operation failed"})),
@@ -2467,18 +2560,10 @@ pub async fn get_agent_kv_key(
 /// PUT /api/memory/agents/:id/kv/:key — Set a KV value.
 pub async fn set_agent_kv_key(
     State(state): State<Arc<AppState>>,
-    Path((id, key)): Path<(String, String)>,
+    Path((_id, key)): Path<(String, String)>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    let agent_id: AgentId = match id.parse() {
-        Ok(id) => id,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "Invalid agent ID"})),
-            );
-        }
-    };
+    let agent_id = openfang_kernel::kernel::shared_memory_agent_id();
 
     let value = body.get("value").cloned().unwrap_or(body);
 
@@ -2488,7 +2573,7 @@ pub async fn set_agent_kv_key(
             Json(serde_json::json!({"status": "stored", "key": key})),
         ),
         Err(e) => {
-            tracing::warn!("Memory set failed for agent {id}, key '{key}': {e}");
+            tracing::warn!("Memory set failed for key '{key}': {e}");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "Memory operation failed"})),
@@ -2500,17 +2585,9 @@ pub async fn set_agent_kv_key(
 /// DELETE /api/memory/agents/:id/kv/:key — Delete a KV value.
 pub async fn delete_agent_kv_key(
     State(state): State<Arc<AppState>>,
-    Path((id, key)): Path<(String, String)>,
+    Path((_id, key)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    let agent_id: AgentId = match id.parse() {
-        Ok(id) => id,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "Invalid agent ID"})),
-            );
-        }
-    };
+    let agent_id = openfang_kernel::kernel::shared_memory_agent_id();
 
     match state.kernel.memory.structured_delete(agent_id, &key) {
         Ok(()) => (
@@ -2518,7 +2595,7 @@ pub async fn delete_agent_kv_key(
             Json(serde_json::json!({"status": "deleted", "key": key})),
         ),
         Err(e) => {
-            tracing::warn!("Memory delete failed for agent {id}, key '{key}': {e}");
+            tracing::warn!("Memory delete failed for key '{key}': {e}");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "Memory operation failed"})),
@@ -2825,6 +2902,14 @@ pub async fn clawhub_search(
         .and_then(|v| v.parse().ok())
         .unwrap_or(20);
 
+    // Check cache (120s TTL)
+    let cache_key = format!("search:{}:{}", query, limit);
+    if let Some(entry) = state.clawhub_cache.get(&cache_key) {
+        if entry.0.elapsed().as_secs() < 120 {
+            return (StatusCode::OK, Json(entry.1.clone()));
+        }
+    }
+
     let cache_dir = state.kernel.config.home_dir.join(".cache").join("clawhub");
     let client = openfang_skills::clawhub::ClawHubClient::new(cache_dir);
 
@@ -2844,20 +2929,26 @@ pub async fn clawhub_search(
                     })
                 })
                 .collect();
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "items": items,
-                    "next_cursor": null,
-                })),
-            )
+            let resp = serde_json::json!({
+                "items": items,
+                "next_cursor": null,
+            });
+            state.clawhub_cache.insert(cache_key, (Instant::now(), resp.clone()));
+            (StatusCode::OK, Json(resp))
         }
         Err(e) => {
-            tracing::warn!("ClawHub search failed: {e}");
+            let msg = format!("{e}");
+            tracing::warn!("ClawHub search failed: {msg}");
+            // Propagate 429 status instead of masking as 200
+            let status = if msg.contains("429") || msg.contains("rate limit") {
+                StatusCode::TOO_MANY_REQUESTS
+            } else {
+                StatusCode::OK
+            };
             (
-                StatusCode::OK,
+                status,
                 Json(
-                    serde_json::json!({"items": [], "next_cursor": null, "error": format!("{e}")}),
+                    serde_json::json!({"items": [], "next_cursor": null, "error": msg}),
                 ),
             )
         }
@@ -2889,6 +2980,14 @@ pub async fn clawhub_browse(
 
     let cursor = params.get("cursor").map(|s| s.as_str());
 
+    // Check cache (120s TTL)
+    let cache_key = format!("browse:{:?}:{}:{}", sort, limit, cursor.unwrap_or(""));
+    if let Some(entry) = state.clawhub_cache.get(&cache_key) {
+        if entry.0.elapsed().as_secs() < 120 {
+            return (StatusCode::OK, Json(entry.1.clone()));
+        }
+    }
+
     let cache_dir = state.kernel.config.home_dir.join(".cache").join("clawhub");
     let client = openfang_skills::clawhub::ClawHubClient::new(cache_dir);
 
@@ -2899,20 +2998,25 @@ pub async fn clawhub_browse(
                 .iter()
                 .map(clawhub_browse_entry_to_json)
                 .collect();
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "items": items,
-                    "next_cursor": results.next_cursor,
-                })),
-            )
+            let resp = serde_json::json!({
+                "items": items,
+                "next_cursor": results.next_cursor,
+            });
+            state.clawhub_cache.insert(cache_key, (Instant::now(), resp.clone()));
+            (StatusCode::OK, Json(resp))
         }
         Err(e) => {
-            tracing::warn!("ClawHub browse failed: {e}");
+            let msg = format!("{e}");
+            tracing::warn!("ClawHub browse failed: {msg}");
+            let status = if msg.contains("429") || msg.contains("rate limit") {
+                StatusCode::TOO_MANY_REQUESTS
+            } else {
+                StatusCode::OK
+            };
             (
-                StatusCode::OK,
+                status,
                 Json(
-                    serde_json::json!({"items": [], "next_cursor": null, "error": format!("{e}")}),
+                    serde_json::json!({"items": [], "next_cursor": null, "error": msg}),
                 ),
             )
         }
@@ -2935,7 +3039,7 @@ pub async fn clawhub_skill_detail(
             let version = detail
                 .latest_version
                 .as_ref()
-                .and_then(|v| v.version.as_deref())
+                .map(|v| v.version.as_str())
                 .unwrap_or("");
             let author = detail
                 .owner
@@ -2977,6 +3081,46 @@ pub async fn clawhub_skill_detail(
             Json(serde_json::json!({"error": format!("{e}")})),
         ),
     }
+}
+
+/// GET /api/clawhub/skill/{slug}/code — Fetch the source code (SKILL.md) of a ClawHub skill.
+pub async fn clawhub_skill_code(
+    State(state): State<Arc<AppState>>,
+    Path(slug): Path<String>,
+) -> impl IntoResponse {
+    let cache_dir = state.kernel.config.home_dir.join(".cache").join("clawhub");
+    let client = openfang_skills::clawhub::ClawHubClient::new(cache_dir);
+
+    // Try to fetch SKILL.md first, then fallback to package.json
+    let mut code = String::new();
+    let mut filename = String::new();
+
+    if let Ok(content) = client.get_file(&slug, "SKILL.md").await {
+        code = content;
+        filename = "SKILL.md".to_string();
+    } else if let Ok(content) = client.get_file(&slug, "package.json").await {
+        code = content;
+        filename = "package.json".to_string();
+    } else if let Ok(content) = client.get_file(&slug, "skill.toml").await {
+        code = content;
+        filename = "skill.toml".to_string();
+    }
+
+    if code.is_empty() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "No source code found for this skill"})),
+        );
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "slug": slug,
+            "filename": filename,
+            "code": code,
+        })),
+    )
 }
 
 /// POST /api/clawhub/install — Install a skill from ClawHub.
@@ -3035,13 +3179,18 @@ pub async fn clawhub_install(
             )
         }
         Err(e) => {
-            let status = if e.to_string().contains("SecurityBlocked") {
+            let msg = format!("{e}");
+            let status = if msg.contains("SecurityBlocked") {
                 StatusCode::FORBIDDEN
+            } else if msg.contains("429") || msg.contains("rate limit") {
+                StatusCode::TOO_MANY_REQUESTS
+            } else if msg.contains("Network error") || msg.contains("returned 4") || msg.contains("returned 5") {
+                StatusCode::BAD_GATEWAY
             } else {
                 StatusCode::INTERNAL_SERVER_ERROR
             };
-            tracing::warn!("ClawHub install failed: {e}");
-            (status, Json(serde_json::json!({"error": format!("{e}")})))
+            tracing::warn!("ClawHub install failed: {msg}");
+            (status, Json(serde_json::json!({"error": msg})))
         }
     }
 }
@@ -3485,6 +3634,42 @@ pub async fn install_hand_deps(
     )
 }
 
+/// POST /api/hands/install — Install a hand from TOML content.
+pub async fn install_hand(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let toml_content = body["toml_content"].as_str().unwrap_or("");
+    let skill_content = body["skill_content"].as_str().unwrap_or("");
+
+    if toml_content.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Missing toml_content field"})),
+        );
+    }
+
+    match state
+        .kernel
+        .hand_registry
+        .install_from_content(toml_content, skill_content)
+    {
+        Ok(def) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "id": def.id,
+                "name": def.name,
+                "description": def.description,
+                "category": format!("{:?}", def.category),
+            })),
+        ),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("{e}")})),
+        ),
+    }
+}
+
 /// POST /api/hands/{hand_id}/activate — Activate a hand (spawns agent).
 pub async fn activate_hand(
     State(state): State<Arc<AppState>>,
@@ -3494,17 +3679,36 @@ pub async fn activate_hand(
     let config = body.map(|b| b.0.config).unwrap_or_default();
 
     match state.kernel.activate_hand(&hand_id, config) {
-        Ok(instance) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "instance_id": instance.instance_id,
-                "hand_id": instance.hand_id,
-                "status": format!("{}", instance.status),
-                "agent_id": instance.agent_id.map(|a| a.to_string()),
-                "agent_name": instance.agent_name,
-                "activated_at": instance.activated_at.to_rfc3339(),
-            })),
-        ),
+        Ok(instance) => {
+            // If the hand agent has a non-reactive schedule (autonomous hands),
+            // start its background loop so it begins running immediately.
+            if let Some(agent_id) = instance.agent_id {
+                let entry = state.kernel.registry.list().into_iter().find(|e| e.id == agent_id);
+                if let Some(entry) = entry {
+                    if !matches!(
+                        entry.manifest.schedule,
+                        openfang_types::agent::ScheduleMode::Reactive
+                    ) {
+                        state.kernel.start_background_for_agent(
+                            agent_id,
+                            &entry.name,
+                            &entry.manifest.schedule,
+                        );
+                    }
+                }
+            }
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "instance_id": instance.instance_id,
+                    "hand_id": instance.hand_id,
+                    "status": format!("{}", instance.status),
+                    "agent_id": instance.agent_id.map(|a| a.to_string()),
+                    "agent_name": instance.agent_name,
+                    "activated_at": instance.activated_at.to_rfc3339(),
+                })),
+            )
+        }
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": format!("{e}")})),
@@ -3559,6 +3763,83 @@ pub async fn deactivate_hand(
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": format!("{e}")})),
+        ),
+    }
+}
+
+/// GET /api/hands/{hand_id}/settings — Get settings schema and current values for a hand.
+pub async fn get_hand_settings(
+    State(state): State<Arc<AppState>>,
+    Path(hand_id): Path<String>,
+) -> impl IntoResponse {
+    let settings_status = match state
+        .kernel
+        .hand_registry
+        .check_settings_availability(&hand_id)
+    {
+        Ok(s) => s,
+        Err(_) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": format!("Hand not found: {hand_id}")})),
+            );
+        }
+    };
+
+    // Find active instance config values (if any)
+    let instance_config: std::collections::HashMap<String, serde_json::Value> = state
+        .kernel
+        .hand_registry
+        .list_instances()
+        .iter()
+        .find(|i| i.hand_id == hand_id)
+        .map(|i| i.config.clone())
+        .unwrap_or_default();
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "hand_id": hand_id,
+            "settings": settings_status,
+            "current_values": instance_config,
+        })),
+    )
+}
+
+/// PUT /api/hands/{hand_id}/settings — Update settings for a hand instance.
+pub async fn update_hand_settings(
+    State(state): State<Arc<AppState>>,
+    Path(hand_id): Path<String>,
+    Json(config): Json<std::collections::HashMap<String, serde_json::Value>>,
+) -> impl IntoResponse {
+    // Find active instance for this hand
+    let instance_id = state
+        .kernel
+        .hand_registry
+        .list_instances()
+        .iter()
+        .find(|i| i.hand_id == hand_id)
+        .map(|i| i.instance_id);
+
+    match instance_id {
+        Some(id) => match state.kernel.hand_registry.update_config(id, config.clone()) {
+            Ok(()) => (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "status": "ok",
+                    "hand_id": hand_id,
+                    "instance_id": id,
+                    "config": config,
+                })),
+            ),
+            Err(e) => (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("{e}")})),
+            ),
+        },
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("No active instance for hand: {hand_id}. Activate the hand first.")})),
         ),
     }
 }
@@ -4318,6 +4599,55 @@ pub async fn agent_budget_ranking(State(state): State<Arc<AppState>>) -> impl In
     Json(serde_json::json!({"agents": agents, "total": agents.len()}))
 }
 
+/// PUT /api/budget/agents/{id} — Update per-agent budget limits at runtime.
+pub async fn update_agent_budget(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let agent_id: AgentId = match id.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid agent ID"})),
+            )
+        }
+    };
+
+    let hourly = body["max_cost_per_hour_usd"].as_f64();
+    let daily = body["max_cost_per_day_usd"].as_f64();
+    let monthly = body["max_cost_per_month_usd"].as_f64();
+
+    if hourly.is_none() && daily.is_none() && monthly.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Provide at least one of: max_cost_per_hour_usd, max_cost_per_day_usd, max_cost_per_month_usd"})),
+        );
+    }
+
+    match state
+        .kernel
+        .registry
+        .update_resources(agent_id, hourly, daily, monthly)
+    {
+        Ok(()) => {
+            // Persist updated entry
+            if let Some(entry) = state.kernel.registry.get(agent_id) {
+                let _ = state.kernel.memory.save_agent(&entry);
+            }
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"status": "ok", "message": "Agent budget updated"})),
+            )
+        }
+        Err(e) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("{e}")})),
+        ),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Session listing endpoints
 // ---------------------------------------------------------------------------
@@ -4720,513 +5050,6 @@ pub async fn run_migrate(Json(req): Json<MigrateRequest>) -> impl IntoResponse {
     }
 }
 
-// ── Config + Custom Model Helpers ───────────────────────────────────
-
-const OPENROUTER_CACHE_TTL_SECS: u64 = 600;
-pub const CONFIG_WATCHER_DEBOUNCE_MS: u64 = 200;
-
-fn normalize_openrouter_model_input(input: &str) -> Option<String> {
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let raw = trimmed.strip_prefix("openrouter/").unwrap_or(trimmed).trim();
-    if raw.is_empty() || raw.chars().any(|c| c.is_whitespace()) {
-        return None;
-    }
-    Some(raw.to_string())
-}
-
-fn openrouter_display_id(raw_model: &str) -> String {
-    format!("openrouter/{}", raw_model.trim())
-}
-
-fn normalize_custom_model_status(status: &str) -> &'static str {
-    match status {
-        "verified" => "verified",
-        "stale" => "stale",
-        _ => "unverified",
-    }
-}
-
-fn compute_custom_openrouter_status(persisted_status: &str, exists_in_catalog: bool) -> String {
-    if exists_in_catalog {
-        return "verified".to_string();
-    }
-    let persisted = normalize_custom_model_status(persisted_status);
-    if persisted == "verified" {
-        "stale".to_string()
-    } else {
-        persisted.to_string()
-    }
-}
-
-fn compute_fingerprint(bytes: &[u8]) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    bytes.hash(&mut hasher);
-    hasher.finish()
-}
-
-fn atomic_write_file(path: &std::path::Path, bytes: &[u8]) -> Result<u64, String> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("create_dir_all failed: {e}"))?;
-    }
-    let parent = path
-        .parent()
-        .ok_or_else(|| "Config path has no parent directory".to_string())?;
-    let file_name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or_else(|| "Config path has no valid file name".to_string())?;
-    let tmp_name = format!(
-        ".{}.tmp-{}-{}",
-        file_name,
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    );
-    let tmp_path = parent.join(tmp_name);
-
-    let write_result: Result<(), String> = (|| {
-        let mut file = std::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&tmp_path)
-            .map_err(|e| format!("open temp failed: {e}"))?;
-        file.write_all(bytes)
-            .map_err(|e| format!("write temp failed: {e}"))?;
-        file.sync_all()
-            .map_err(|e| format!("sync temp failed: {e}"))?;
-        std::fs::rename(&tmp_path, path).map_err(|e| format!("rename failed: {e}"))?;
-        #[cfg(unix)]
-        {
-            if let Ok(dir) = std::fs::File::open(parent) {
-                let _ = dir.sync_all();
-            }
-        }
-        Ok(())
-    })();
-
-    if let Err(e) = write_result {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(e);
-    }
-
-    Ok(compute_fingerprint(bytes))
-}
-
-fn read_config_table(config_path: &std::path::Path) -> Result<toml::value::Table, String> {
-    if !config_path.exists() {
-        return Ok(toml::value::Table::new());
-    }
-    let content = std::fs::read_to_string(config_path)
-        .map_err(|e| format!("Failed to read config file: {e}"))?;
-    if content.trim().is_empty() {
-        return Ok(toml::value::Table::new());
-    }
-    toml::from_str::<toml::value::Table>(&content).map_err(|e| format!("Invalid TOML: {e}"))
-}
-
-async fn push_model_warning(state: &Arc<AppState>, warning: String) {
-    let mut warnings = state.model_warnings.write().await;
-    if !warnings.iter().any(|w| w == &warning) {
-        warnings.push(warning);
-    }
-}
-
-async fn clear_model_warning_prefix(state: &Arc<AppState>, prefix: &str) {
-    let mut warnings = state.model_warnings.write().await;
-    warnings.retain(|w| !w.starts_with(prefix));
-}
-
-async fn mutate_config_table<R, F>(state: &Arc<AppState>, mutate: F) -> Result<R, String>
-where
-    F: FnOnce(&mut toml::value::Table) -> Result<R, String>,
-{
-    let config_path = state.kernel.config.home_dir.join("config.toml");
-    let (result, fingerprint) = {
-        let _guard = state
-            .config_write_lock
-            .lock()
-            .map_err(|_| "Config write lock poisoned".to_string())?;
-
-        let mut table = read_config_table(&config_path)?;
-        let result = mutate(&mut table)?;
-        let candidate = toml::Value::Table(table.clone());
-        let _: openfang_types::config::KernelConfig = candidate
-            .clone()
-            .try_into()
-            .map_err(|e| format!("Config validation failed: {e}"))?;
-        let toml_string = toml::to_string_pretty(&candidate)
-            .map_err(|e| format!("Config serialize failed: {e}"))?;
-        let fingerprint = atomic_write_file(&config_path, toml_string.as_bytes())?;
-        (result, fingerprint)
-    };
-
-    let mut marker = state.last_config_write_fingerprint.write().await;
-    *marker = Some(fingerprint);
-    Ok(result)
-}
-
-fn load_effective_kernel_config(state: &Arc<AppState>) -> (openfang_types::config::KernelConfig, Vec<String>) {
-    let mut warnings = Vec::new();
-    let config_path = state.kernel.config.home_dir.join("config.toml");
-    if config_path.exists() {
-        match std::fs::read_to_string(&config_path) {
-            Ok(content) => {
-                if let Err(e) = toml::from_str::<toml::Value>(&content) {
-                    warnings.push(format!("Config parse error: {e}"));
-                    return (state.kernel.config.clone(), warnings);
-                }
-            }
-            Err(e) => {
-                warnings.push(format!("Config read error: {e}"));
-                return (state.kernel.config.clone(), warnings);
-            }
-        }
-        (openfang_kernel::config::load_config(Some(&config_path)), warnings)
-    } else {
-        (state.kernel.config.clone(), warnings)
-    }
-}
-
-fn provider_defaults(
-    state: &Arc<AppState>,
-    provider: &str,
-) -> (String, Option<String>) {
-    let catalog = state
-        .kernel
-        .model_catalog
-        .read()
-        .unwrap_or_else(|e| e.into_inner());
-    if let Some(p) = catalog.get_provider(provider) {
-        (
-            p.api_key_env.clone(),
-            if p.base_url.is_empty() {
-                None
-            } else {
-                Some(p.base_url.clone())
-            },
-        )
-    } else {
-        (String::new(), None)
-    }
-}
-
-fn upsert_custom_model_entry(
-    root: &mut toml::value::Table,
-    provider: &str,
-    model: &str,
-    label: Option<String>,
-    status: &str,
-    verified_at: Option<String>,
-    last_error: Option<String>,
-) -> Result<(), String> {
-    let entry = root
-        .entry("custom_models".to_string())
-        .or_insert_with(|| toml::Value::Array(Vec::new()));
-    let arr = entry
-        .as_array_mut()
-        .ok_or_else(|| "custom_models is not an array".to_string())?;
-
-    let mut found = false;
-    for item in arr.iter_mut() {
-        if let Some(tbl) = item.as_table_mut() {
-            let p = tbl.get("provider").and_then(|v| v.as_str()).unwrap_or("");
-            let m = tbl.get("model").and_then(|v| v.as_str()).unwrap_or("");
-            if p == provider && m == model {
-                tbl.insert("provider".to_string(), toml::Value::String(provider.to_string()));
-                tbl.insert("model".to_string(), toml::Value::String(model.to_string()));
-                if let Some(lbl) = label.clone() {
-                    if lbl.trim().is_empty() {
-                        tbl.remove("label");
-                    } else {
-                        tbl.insert("label".to_string(), toml::Value::String(lbl));
-                    }
-                } else {
-                    tbl.remove("label");
-                }
-                tbl.insert(
-                    "status".to_string(),
-                    toml::Value::String(normalize_custom_model_status(status).to_string()),
-                );
-                match verified_at.clone() {
-                    Some(ts) => {
-                        tbl.insert("verified_at".to_string(), toml::Value::String(ts));
-                    }
-                    None => {
-                        tbl.remove("verified_at");
-                    }
-                }
-                match last_error.clone() {
-                    Some(err) if !err.trim().is_empty() => {
-                        tbl.insert("last_error".to_string(), toml::Value::String(err));
-                    }
-                    _ => {
-                        tbl.remove("last_error");
-                    }
-                }
-                found = true;
-                break;
-            }
-        }
-    }
-
-    if !found {
-        let mut tbl = toml::value::Table::new();
-        tbl.insert("provider".to_string(), toml::Value::String(provider.to_string()));
-        tbl.insert("model".to_string(), toml::Value::String(model.to_string()));
-        if let Some(lbl) = label {
-            if !lbl.trim().is_empty() {
-                tbl.insert("label".to_string(), toml::Value::String(lbl));
-            }
-        }
-        tbl.insert(
-            "status".to_string(),
-            toml::Value::String(normalize_custom_model_status(status).to_string()),
-        );
-        if let Some(ts) = verified_at {
-            tbl.insert("verified_at".to_string(), toml::Value::String(ts));
-        }
-        if let Some(err) = last_error {
-            if !err.trim().is_empty() {
-                tbl.insert("last_error".to_string(), toml::Value::String(err));
-            }
-        }
-        arr.push(toml::Value::Table(tbl));
-    }
-
-    Ok(())
-}
-
-fn remove_custom_model_entry(
-    root: &mut toml::value::Table,
-    provider: &str,
-    model: &str,
-) -> Result<bool, String> {
-    let Some(value) = root.get_mut("custom_models") else {
-        return Ok(false);
-    };
-    let arr = value
-        .as_array_mut()
-        .ok_or_else(|| "custom_models is not an array".to_string())?;
-    let before = arr.len();
-    arr.retain(|item| {
-        let Some(tbl) = item.as_table() else {
-            return true;
-        };
-        let p = tbl.get("provider").and_then(|v| v.as_str()).unwrap_or("");
-        let m = tbl.get("model").and_then(|v| v.as_str()).unwrap_or("");
-        !(p == provider && m == model)
-    });
-    Ok(arr.len() != before)
-}
-
-async fn get_openrouter_catalog_cached(
-    state: &Arc<AppState>,
-) -> Option<HashSet<String>> {
-    let cache = state.openrouter_catalog_cache.read().await;
-    let Some(cache) = cache.as_ref() else {
-        return None;
-    };
-    if cache.fetched_at.elapsed() <= Duration::from_secs(OPENROUTER_CACHE_TTL_SECS)
-        && cache.last_error.is_none()
-    {
-        return Some(cache.model_ids.clone());
-    }
-    None
-}
-
-async fn fetch_openrouter_catalog(
-    state: &Arc<AppState>,
-    force_refresh: bool,
-) -> Result<HashSet<String>, String> {
-    if !force_refresh {
-        if let Some(ids) = get_openrouter_catalog_cached(state).await {
-            return Ok(ids);
-        }
-    }
-
-    let (base_url, api_key_env) = {
-        let catalog = state
-            .kernel
-            .model_catalog
-            .read()
-            .unwrap_or_else(|e| e.into_inner());
-        let provider = catalog
-            .get_provider("openrouter")
-            .ok_or_else(|| "OpenRouter provider not found in catalog".to_string())?;
-        (provider.base_url.clone(), provider.api_key_env.clone())
-    };
-    let api_key = std::env::var(&api_key_env).ok();
-    let url = format!("{}/models", base_url.trim_end_matches('/'));
-
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
-    let mut req = client.get(&url);
-    if let Some(key) = api_key {
-        if !key.trim().is_empty() {
-            req = req.header("Authorization", format!("Bearer {key}"));
-        }
-    }
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| format!("OpenRouter catalog request failed: {e}"))?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        let snippet = body.chars().take(200).collect::<String>();
-        let err = format!("OpenRouter catalog request failed: HTTP {status} {snippet}");
-        let mut cache = state.openrouter_catalog_cache.write().await;
-        if let Some(existing) = cache.as_mut() {
-            existing.last_error = Some(err.clone());
-            existing.fetched_at = Instant::now();
-        } else {
-            *cache = Some(OpenRouterCatalogCache {
-                model_ids: HashSet::new(),
-                fetched_at: Instant::now(),
-                etag: None,
-                last_error: Some(err.clone()),
-            });
-        }
-        return Err(err);
-    }
-
-    let etag = resp
-        .headers()
-        .get(reqwest::header::ETAG)
-        .and_then(|v| v.to_str().ok())
-        .map(ToString::to_string);
-    let body: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("OpenRouter catalog JSON parse failed: {e}"))?;
-    let ids: HashSet<String> = body
-        .get("data")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|entry| entry.get("id").and_then(|v| v.as_str()))
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(ToString::to_string)
-                .collect()
-        })
-        .unwrap_or_default();
-    if ids.is_empty() {
-        let err = "OpenRouter catalog returned no models".to_string();
-        let mut cache = state.openrouter_catalog_cache.write().await;
-        if let Some(existing) = cache.as_mut() {
-            existing.last_error = Some(err.clone());
-            existing.fetched_at = Instant::now();
-        } else {
-            *cache = Some(OpenRouterCatalogCache {
-                model_ids: HashSet::new(),
-                fetched_at: Instant::now(),
-                etag: None,
-                last_error: Some(err.clone()),
-            });
-        }
-        return Err(err);
-    }
-
-    let mut cache = state.openrouter_catalog_cache.write().await;
-    *cache = Some(OpenRouterCatalogCache {
-        model_ids: ids.clone(),
-        fetched_at: Instant::now(),
-        etag,
-        last_error: None,
-    });
-    Ok(ids)
-}
-
-pub async fn refresh_custom_models_from_openrouter(
-    state: Arc<AppState>,
-    persist_updates: bool,
-) -> Result<usize, String> {
-    clear_model_warning_prefix(&state, "verify-failed:").await;
-    let ids = match fetch_openrouter_catalog(&state, true).await {
-        Ok(ids) => ids,
-        Err(e) => {
-            push_model_warning(&state, format!("verify-failed: {e}")).await;
-            return Err(e);
-        }
-    };
-
-    let (effective_config, _) = load_effective_kernel_config(&state);
-    if effective_config.custom_models.is_empty() {
-        return Ok(0);
-    }
-
-    let now = chrono::Utc::now().to_rfc3339();
-    let mut changed = false;
-    let mut updated = effective_config.custom_models.clone();
-    for entry in &mut updated {
-        if entry.provider != "openrouter" {
-            continue;
-        }
-        let Some(normalized) = normalize_openrouter_model_input(&entry.model) else {
-            if entry.status != "unverified" {
-                changed = true;
-                entry.status = "unverified".to_string();
-            }
-            entry.last_error = Some("Invalid model identifier".to_string());
-            entry.verified_at = None;
-            continue;
-        };
-        entry.model = normalized.clone();
-        let exists = ids.contains(&normalized);
-        let old = normalize_custom_model_status(&entry.status).to_string();
-        let new_status = compute_custom_openrouter_status(&entry.status, exists);
-        if old != new_status {
-            changed = true;
-        }
-        entry.status = new_status;
-        if exists {
-            if entry.verified_at.as_deref() != Some(now.as_str()) {
-                changed = true;
-            }
-            entry.verified_at = Some(now.clone());
-            if entry.last_error.is_some() {
-                changed = true;
-            }
-            entry.last_error = None;
-        } else {
-            if entry.last_error.as_deref() != Some("Model not found in OpenRouter catalog") {
-                changed = true;
-            }
-            entry.last_error = Some("Model not found in OpenRouter catalog".to_string());
-        }
-    }
-
-    if persist_updates && changed {
-        let updates = updated.clone();
-        mutate_config_table(&state, move |root| {
-            root.remove("custom_models");
-            for entry in updates {
-                upsert_custom_model_entry(
-                    root,
-                    &entry.provider,
-                    &entry.model,
-                    entry.label.clone(),
-                    &entry.status,
-                    entry.verified_at.clone(),
-                    entry.last_error.clone(),
-                )?;
-            }
-            Ok(())
-        })
-        .await?;
-    }
-
-    Ok(updated.len())
-}
-
 // ── Model Catalog Endpoints ─────────────────────────────────────────
 
 /// GET /api/models — List all models in the catalog.
@@ -5239,6 +5062,11 @@ pub async fn list_models(
     State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
+    let catalog = state
+        .kernel
+        .model_catalog
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
     let provider_filter = params.get("provider").map(|s| s.to_lowercase());
     let tier_filter = params.get("tier").map(|s| s.to_lowercase());
     let available_only = params
@@ -5246,165 +5074,59 @@ pub async fn list_models(
         .map(|v| v == "true" || v == "1")
         .unwrap_or(false);
 
-    let (models, total, available_count, has_openrouter_key): (
-        Vec<serde_json::Value>,
-        usize,
-        usize,
-        bool,
-    ) = {
-        let catalog = state
-            .kernel
-            .model_catalog
-            .read()
-            .unwrap_or_else(|e| e.into_inner());
-
-        let models: Vec<serde_json::Value> = catalog
-            .list_models()
-            .iter()
-            .filter(|m| {
-                if let Some(ref p) = provider_filter {
-                    if m.provider.to_lowercase() != *p {
+    let models: Vec<serde_json::Value> = catalog
+        .list_models()
+        .iter()
+        .filter(|m| {
+            if let Some(ref p) = provider_filter {
+                if m.provider.to_lowercase() != *p {
+                    return false;
+                }
+            }
+            if let Some(ref t) = tier_filter {
+                if m.tier.to_string() != *t {
+                    return false;
+                }
+            }
+            if available_only {
+                let provider = catalog.get_provider(&m.provider);
+                if let Some(p) = provider {
+                    if p.auth_status == openfang_types::model_catalog::AuthStatus::Missing {
                         return false;
                     }
                 }
-                if let Some(ref t) = tier_filter {
-                    if m.tier.to_string() != *t {
-                        return false;
-                    }
-                }
-                if available_only {
-                    let provider = catalog.get_provider(&m.provider);
-                    if let Some(p) = provider {
-                        if p.auth_status == openfang_types::model_catalog::AuthStatus::Missing {
-                            return false;
-                        }
-                    }
-                }
-                true
+            }
+            true
+        })
+        .map(|m| {
+            let available = catalog
+                .get_provider(&m.provider)
+                .map(|p| p.auth_status != openfang_types::model_catalog::AuthStatus::Missing)
+                .unwrap_or(false);
+            serde_json::json!({
+                "id": m.id,
+                "display_name": m.display_name,
+                "provider": m.provider,
+                "tier": m.tier,
+                "context_window": m.context_window,
+                "max_output_tokens": m.max_output_tokens,
+                "input_cost_per_m": m.input_cost_per_m,
+                "output_cost_per_m": m.output_cost_per_m,
+                "supports_tools": m.supports_tools,
+                "supports_vision": m.supports_vision,
+                "supports_streaming": m.supports_streaming,
+                "available": available,
             })
-            .map(|m| {
-                let available = catalog
-                    .get_provider(&m.provider)
-                    .map(|p| p.auth_status != openfang_types::model_catalog::AuthStatus::Missing)
-                    .unwrap_or(false);
-                serde_json::json!({
-                    "id": m.id,
-                    "display_name": m.display_name,
-                    "provider": m.provider,
-                    "tier": m.tier,
-                    "context_window": m.context_window,
-                    "max_output_tokens": m.max_output_tokens,
-                    "input_cost_per_m": m.input_cost_per_m,
-                    "output_cost_per_m": m.output_cost_per_m,
-                    "supports_tools": m.supports_tools,
-                    "supports_vision": m.supports_vision,
-                    "supports_streaming": m.supports_streaming,
-                    "available": available,
-                })
-            })
-            .collect();
+        })
+        .collect();
 
-        let total = catalog.list_models().len();
-        let available_count = catalog.available_models().len();
-        let has_openrouter_key = catalog
-            .get_provider("openrouter")
-            .map(|p| std::env::var(&p.api_key_env).map(|v| !v.is_empty()).unwrap_or(false))
-            .unwrap_or(false);
-
-        (models, total, available_count, has_openrouter_key)
-    };
-
-    let (effective_config, mut config_warnings) = load_effective_kernel_config(&state);
-    let runtime_warning_snapshot = state.model_warnings.read().await.clone();
-
-    let cached_openrouter_ids = get_openrouter_catalog_cached(&state).await;
-    let cache_last_error = state
-        .openrouter_catalog_cache
-        .read()
-        .await
-        .as_ref()
-        .and_then(|c| c.last_error.clone());
-
-    let mut custom_models: Vec<serde_json::Value> = Vec::new();
-    let mut custom_status_map: HashMap<(String, String), String> = HashMap::new();
-    for cm in &effective_config.custom_models {
-        let provider = cm.provider.to_lowercase();
-        if provider != "openrouter" {
-            continue;
-        }
-        let Some(raw_model) = normalize_openrouter_model_input(&cm.model) else {
-            config_warnings.push(format!("Invalid custom model ID: {}", cm.model));
-            continue;
-        };
-        let persisted_status = normalize_custom_model_status(&cm.status).to_string();
-        let runtime_status = if let Some(ids) = &cached_openrouter_ids {
-            compute_custom_openrouter_status(&persisted_status, ids.contains(&raw_model))
-        } else {
-            persisted_status.clone()
-        };
-        custom_status_map.insert((provider.clone(), raw_model.clone()), runtime_status.clone());
-        custom_models.push(serde_json::json!({
-            "provider": provider,
-            "model": raw_model,
-            "display_id": openrouter_display_id(&raw_model),
-            "label": cm.label,
-            "status": persisted_status,
-            "runtime_status": runtime_status,
-            "verified_at": cm.verified_at,
-            "last_error": cm.last_error,
-            "available": has_openrouter_key,
-        }));
-    }
-
-    let active_provider = effective_config.default_model.provider.to_lowercase();
-    let active_model_raw = if active_provider == "openrouter" {
-        normalize_openrouter_model_input(&effective_config.default_model.model)
-            .unwrap_or_else(|| effective_config.default_model.model.trim().to_string())
-    } else {
-        effective_config.default_model.model.trim().to_string()
-    };
-    let active_display_id = if active_provider == "openrouter" {
-        openrouter_display_id(&active_model_raw)
-    } else {
-        format!("{}/{}", active_provider, active_model_raw)
-    };
-    let active_status = custom_status_map
-        .get(&(active_provider.clone(), active_model_raw.clone()))
-        .cloned()
-        .unwrap_or_else(|| "catalog".to_string());
-
-    let mut warnings = runtime_warning_snapshot;
-    warnings.append(&mut config_warnings);
-    if let Some(err) = cache_last_error {
-        warnings.push(format!("verify-failed: {err}"));
-    }
-    if active_provider == "openrouter" && !has_openrouter_key {
-        warnings.push("missing-key: OPENROUTER_API_KEY is not configured".to_string());
-    }
-    if effective_config.default_model.provider != state.kernel.config.default_model.provider
-        || effective_config.default_model.model != state.kernel.config.default_model.model
-    {
-        warnings.push(
-            "runtime-mismatch: config default_model differs from currently booted kernel model"
-                .to_string(),
-        );
-    }
-    warnings.sort();
-    warnings.dedup();
+    let total = catalog.list_models().len();
+    let available_count = catalog.available_models().len();
 
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "models": models,
-            "custom_models": custom_models,
-            "active_model": {
-                "provider": active_provider,
-                "model": active_model_raw,
-                "display_id": active_display_id,
-                "source": "config.default_model",
-                "status": active_status,
-            },
-            "warnings": warnings,
             "total": total,
             "available": available_count,
         })),
@@ -5435,495 +5157,6 @@ pub async fn list_aliases(State(state): State<Arc<AppState>>) -> impl IntoRespon
         Json(serde_json::json!({
             "aliases": entries,
             "total": entries.len(),
-        })),
-    )
-}
-
-/// POST /api/models/custom/verify — Verify a pasted OpenRouter model ID.
-pub async fn verify_custom_model(
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<serde_json::Value>,
-) -> impl IntoResponse {
-    let provider = body["provider"].as_str().unwrap_or("openrouter").to_lowercase();
-    if provider != "openrouter" {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "Only provider=openrouter is supported"})),
-        );
-    }
-    let model_input = match body["model_input"].as_str() {
-        Some(v) if !v.trim().is_empty() => v,
-        _ => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "Missing 'model_input' field"})),
-            );
-        }
-    };
-    let normalized = match normalize_openrouter_model_input(model_input) {
-        Some(v) => v,
-        None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "Invalid OpenRouter model identifier"})),
-            );
-        }
-    };
-
-    match fetch_openrouter_catalog(&state, true).await {
-        Ok(ids) => {
-            let verified = ids.contains(&normalized);
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "ok": verified,
-                    "normalized_model": normalized.clone(),
-                    "display_id": openrouter_display_id(&normalized),
-                    "verified": verified,
-                    "reason": if verified { serde_json::Value::Null } else { serde_json::json!("Model not found in OpenRouter catalog") },
-                })),
-            )
-        }
-        Err(e) => {
-            push_model_warning(&state, format!("verify-failed: {e}")).await;
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "ok": false,
-                    "normalized_model": normalized.clone(),
-                    "display_id": openrouter_display_id(&normalized),
-                    "verified": false,
-                    "reason": e,
-                })),
-            )
-        }
-    }
-}
-
-/// POST /api/models/custom — Save/update a custom model entry.
-pub async fn save_custom_model(
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<serde_json::Value>,
-) -> impl IntoResponse {
-    let provider = body["provider"].as_str().unwrap_or("openrouter").to_lowercase();
-    if provider != "openrouter" {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "Only provider=openrouter is supported"})),
-        );
-    }
-    let model_input = match body["model"].as_str() {
-        Some(v) if !v.trim().is_empty() => v,
-        _ => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "Missing 'model' field"})),
-            );
-        }
-    };
-    let model = match normalize_openrouter_model_input(model_input) {
-        Some(v) => v,
-        None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "Invalid OpenRouter model identifier"})),
-            );
-        }
-    };
-    let label = body["label"].as_str().map(|s| s.trim().to_string());
-
-    let (status, verified_at, last_error) = if let Some(ids) = get_openrouter_catalog_cached(&state).await {
-        if ids.contains(&model) {
-            ("verified".to_string(), Some(chrono::Utc::now().to_rfc3339()), None)
-        } else {
-            (
-                "unverified".to_string(),
-                None,
-                Some("Model not found in cached OpenRouter catalog".to_string()),
-            )
-        }
-    } else {
-        (
-            "unverified".to_string(),
-            None,
-            Some("Not verified yet. Use verify or wait for background re-check.".to_string()),
-        )
-    };
-
-    let provider_for_write = provider.clone();
-    let model_for_write = model.clone();
-    let label_for_write = label.clone();
-    let status_for_write = status.clone();
-    let verified_for_write = verified_at.clone();
-    let error_for_write = last_error.clone();
-    if let Err(e) = mutate_config_table(&state, move |root| {
-        upsert_custom_model_entry(
-            root,
-            &provider_for_write,
-            &model_for_write,
-            label_for_write,
-            &status_for_write,
-            verified_for_write,
-            error_for_write,
-        )
-    })
-    .await
-    {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Failed to save custom model: {e}")})),
-        );
-    }
-
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "status": "saved",
-            "custom_model": {
-                "provider": provider,
-                "model": model,
-                "display_id": openrouter_display_id(&model),
-                "label": label,
-                "status": status,
-                "verified_at": verified_at,
-                "last_error": last_error,
-            }
-        })),
-    )
-}
-
-/// POST /api/models/custom/use — Set custom model as default or fallback.
-pub async fn use_custom_model(
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<serde_json::Value>,
-) -> impl IntoResponse {
-    let provider = body["provider"].as_str().unwrap_or("openrouter").to_lowercase();
-    let target = body["target"]
-        .as_str()
-        .unwrap_or("default")
-        .trim()
-        .to_lowercase();
-    let model_input = match body["model"].as_str() {
-        Some(v) if !v.trim().is_empty() => v,
-        _ => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "Missing 'model' field"})),
-            );
-        }
-    };
-    let model = if provider == "openrouter" {
-        match normalize_openrouter_model_input(model_input) {
-            Some(v) => v,
-            None => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({"error": "Invalid OpenRouter model identifier"})),
-                );
-            }
-        }
-    } else {
-        model_input.trim().to_string()
-    };
-
-    let (api_key_env, base_url) = provider_defaults(&state, &provider);
-    let provider_for_write = provider.clone();
-    let model_for_write = model.clone();
-    let api_key_for_write = api_key_env.clone();
-    let base_url_for_write = base_url.clone();
-    let target_for_write = target.clone();
-    let write_result = mutate_config_table(&state, move |root| {
-        if target_for_write == "default" {
-            let section = root
-                .entry("default_model".to_string())
-                .or_insert_with(|| toml::Value::Table(toml::value::Table::new()));
-            let table = section
-                .as_table_mut()
-                .ok_or_else(|| "default_model is not a table".to_string())?;
-            table.insert(
-                "provider".to_string(),
-                toml::Value::String(provider_for_write.clone()),
-            );
-            table.insert(
-                "model".to_string(),
-                toml::Value::String(model_for_write.clone()),
-            );
-            if !api_key_for_write.is_empty() {
-                table.insert(
-                    "api_key_env".to_string(),
-                    toml::Value::String(api_key_for_write.clone()),
-                );
-            }
-            if let Some(url) = base_url_for_write.clone() {
-                table.insert("base_url".to_string(), toml::Value::String(url));
-            } else {
-                table.remove("base_url");
-            }
-        } else if target_for_write == "fallback" {
-            let arr = root
-                .entry("fallback_providers".to_string())
-                .or_insert_with(|| toml::Value::Array(Vec::new()))
-                .as_array_mut()
-                .ok_or_else(|| "fallback_providers is not an array".to_string())?;
-            let mut found = false;
-            for item in arr.iter_mut() {
-                let Some(tbl) = item.as_table_mut() else {
-                    continue;
-                };
-                let p = tbl.get("provider").and_then(|v| v.as_str()).unwrap_or("");
-                let m = tbl.get("model").and_then(|v| v.as_str()).unwrap_or("");
-                if p == provider_for_write && m == model_for_write {
-                    found = true;
-                    break;
-                }
-            }
-            if !found {
-                let mut tbl = toml::value::Table::new();
-                tbl.insert(
-                    "provider".to_string(),
-                    toml::Value::String(provider_for_write.clone()),
-                );
-                tbl.insert(
-                    "model".to_string(),
-                    toml::Value::String(model_for_write.clone()),
-                );
-                if !api_key_for_write.is_empty() {
-                    tbl.insert(
-                        "api_key_env".to_string(),
-                        toml::Value::String(api_key_for_write.clone()),
-                    );
-                }
-                if let Some(url) = base_url_for_write.clone() {
-                    tbl.insert("base_url".to_string(), toml::Value::String(url));
-                }
-                arr.push(toml::Value::Table(tbl));
-            }
-        } else {
-            return Err("target must be 'default' or 'fallback'".to_string());
-        }
-        Ok(())
-    })
-    .await;
-
-    if let Err(e) = write_result {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Failed to update model routing: {e}")})),
-        );
-    }
-
-    let reload_status = match state.kernel.reload_config() {
-        Ok(plan) => {
-            if plan.restart_required {
-                "applied_partial"
-            } else {
-                "applied"
-            }
-        }
-        Err(_) => "saved_reload_failed",
-    };
-
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "status": reload_status,
-            "target": target,
-            "provider": provider,
-            "model": model,
-        })),
-    )
-}
-
-/// DELETE /api/models/custom/{provider}/{model}?force=true|false — Remove custom model.
-pub async fn delete_custom_model(
-    State(state): State<Arc<AppState>>,
-    Path((provider, model_path)): Path<(String, String)>,
-    Query(params): Query<HashMap<String, String>>,
-) -> impl IntoResponse {
-    let provider = provider.to_lowercase();
-    let force = params
-        .get("force")
-        .map(|v| v == "true" || v == "1")
-        .unwrap_or(false);
-    let model = if provider == "openrouter" {
-        match normalize_openrouter_model_input(&model_path) {
-            Some(v) => v,
-            None => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({"error": "Invalid OpenRouter model identifier"})),
-                );
-            }
-        }
-    } else {
-        model_path.trim().to_string()
-    };
-
-    let (effective_config, _) = load_effective_kernel_config(&state);
-    let default_model_matches = if provider == "openrouter" {
-        normalize_openrouter_model_input(&effective_config.default_model.model)
-            .map(|m| m == model)
-            .unwrap_or(false)
-    } else {
-        effective_config.default_model.model == model
-    };
-    let in_default = effective_config.default_model.provider.eq_ignore_ascii_case(&provider)
-        && default_model_matches;
-    let in_fallback = effective_config
-        .fallback_providers
-        .iter()
-        .any(|fb| {
-            if !fb.provider.eq_ignore_ascii_case(&provider) {
-                return false;
-            }
-            if provider == "openrouter" {
-                normalize_openrouter_model_input(&fb.model)
-                    .map(|m| m == model)
-                    .unwrap_or(false)
-            } else {
-                fb.model == model
-            }
-        });
-
-    if (in_default || in_fallback) && !force {
-        return (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({
-                "error": "Model is currently in use (default and/or fallback). Re-run with force=true.",
-                "in_use": {
-                    "default": in_default,
-                    "fallback": in_fallback,
-                }
-            })),
-        );
-    }
-
-    let fallback_candidate = if force && in_default {
-        effective_config
-            .fallback_providers
-            .iter()
-            .find(|fb| !(fb.provider.eq_ignore_ascii_case(&provider) && fb.model == model))
-            .map(|fb| {
-                let (env_from_catalog, url_from_catalog) = provider_defaults(&state, &fb.provider);
-                (
-                    fb.provider.clone(),
-                    fb.model.clone(),
-                    if fb.api_key_env.is_empty() {
-                        env_from_catalog
-                    } else {
-                        fb.api_key_env.clone()
-                    },
-                    fb.base_url.clone().or(url_from_catalog),
-                )
-            })
-            .or_else(|| {
-                effective_config
-                    .custom_models
-                    .iter()
-                    .find(|cm| {
-                        cm.provider.eq_ignore_ascii_case("openrouter")
-                            && normalize_openrouter_model_input(&cm.model)
-                                .map(|m| m != model)
-                                .unwrap_or(false)
-                            && !cm.model.trim().is_empty()
-                    })
-                    .map(|cm| {
-                        let (env, url) = provider_defaults(&state, "openrouter");
-                        let normalized =
-                            normalize_openrouter_model_input(&cm.model).unwrap_or_else(|| cm.model.clone());
-                        ("openrouter".to_string(), normalized, env, url)
-                    })
-            })
-            .or_else(|| {
-                let (env, url) = provider_defaults(&state, "openrouter");
-                Some(("openrouter".to_string(), "auto".to_string(), env, url))
-            })
-    } else {
-        None
-    };
-
-    let provider_for_write = provider.clone();
-    let model_for_write = model.clone();
-    let write_result = mutate_config_table(&state, move |root| {
-        if force && in_default {
-            let Some((fb_provider, fb_model, fb_key_env, fb_base_url)) = fallback_candidate.clone() else {
-                return Err("No safe fallback model available; cannot force-remove active default model".to_string());
-            };
-            let section = root
-                .entry("default_model".to_string())
-                .or_insert_with(|| toml::Value::Table(toml::value::Table::new()));
-            let table = section
-                .as_table_mut()
-                .ok_or_else(|| "default_model is not a table".to_string())?;
-            table.insert("provider".to_string(), toml::Value::String(fb_provider));
-            table.insert("model".to_string(), toml::Value::String(fb_model));
-            if !fb_key_env.is_empty() {
-                table.insert("api_key_env".to_string(), toml::Value::String(fb_key_env));
-            } else {
-                table.remove("api_key_env");
-            }
-            if let Some(url) = fb_base_url {
-                table.insert("base_url".to_string(), toml::Value::String(url));
-            } else {
-                table.remove("base_url");
-            }
-        }
-
-        if let Some(arr) = root
-            .get_mut("fallback_providers")
-            .and_then(|v| v.as_array_mut())
-        {
-            arr.retain(|item| {
-                let Some(tbl) = item.as_table() else {
-                    return true;
-                };
-                let p = tbl.get("provider").and_then(|v| v.as_str()).unwrap_or("");
-                let m = tbl.get("model").and_then(|v| v.as_str()).unwrap_or("");
-                !(p.eq_ignore_ascii_case(&provider_for_write) && m == model_for_write)
-            });
-        }
-
-        let removed = remove_custom_model_entry(root, &provider_for_write, &model_for_write)?;
-        if !removed {
-            return Err("Custom model not found".to_string());
-        }
-        Ok(())
-    })
-    .await;
-
-    if let Err(e) = write_result {
-        let status = if e.contains("not found") {
-            StatusCode::NOT_FOUND
-        } else if e.contains("safe fallback") {
-            StatusCode::CONFLICT
-        } else {
-            StatusCode::INTERNAL_SERVER_ERROR
-        };
-        return (status, Json(serde_json::json!({ "error": e })));
-    }
-
-    let reload_status = if force && (in_default || in_fallback) {
-        match state.kernel.reload_config() {
-            Ok(plan) => {
-                if plan.restart_required {
-                    "applied_partial"
-                } else {
-                    "applied"
-                }
-            }
-            Err(_) => "saved_reload_failed",
-        }
-    } else {
-        "saved"
-    };
-
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "status": reload_status,
-            "provider": provider,
-            "model": model,
-            "forced": force,
         })),
     )
 }
@@ -6005,6 +5238,10 @@ pub async fn list_providers(State(state): State<Arc<AppState>>) -> impl IntoResp
             entry["latency_ms"] = serde_json::json!(probe.latency_ms);
             if !probe.discovered_models.is_empty() {
                 entry["discovered_models"] = serde_json::json!(probe.discovered_models);
+                // Merge discovered models into the catalog so agents can use them
+                if let Ok(mut catalog) = state.kernel.model_catalog.write() {
+                    catalog.merge_discovered_models(&p.id, &probe.discovered_models);
+                }
             }
             if let Some(err) = &probe.error {
                 entry["error"] = serde_json::json!(err);
@@ -6021,6 +5258,134 @@ pub async fn list_providers(State(state): State<Arc<AppState>>) -> impl IntoResp
             "providers": providers,
             "total": total,
         })),
+    )
+}
+
+/// POST /api/models/custom — Add a custom model to the catalog.
+///
+/// Persists to `~/.openfang/custom_models.json` and makes the model immediately
+/// available for agent assignment.
+pub async fn add_custom_model(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let id = body
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let provider = body
+        .get("provider")
+        .and_then(|v| v.as_str())
+        .unwrap_or("openrouter")
+        .to_string();
+    let context_window = body
+        .get("context_window")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(128_000);
+    let max_output = body
+        .get("max_output_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(8_192);
+
+    if id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Missing required field: id"})),
+        );
+    }
+
+    let display = body
+        .get("display_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or(&id)
+        .to_string();
+
+    let entry = openfang_types::model_catalog::ModelCatalogEntry {
+        id: id.clone(),
+        display_name: display,
+        provider: provider.clone(),
+        tier: openfang_types::model_catalog::ModelTier::Custom,
+        context_window,
+        max_output_tokens: max_output,
+        input_cost_per_m: body
+            .get("input_cost_per_m")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0),
+        output_cost_per_m: body
+            .get("output_cost_per_m")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0),
+        supports_tools: body
+            .get("supports_tools")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true),
+        supports_vision: body
+            .get("supports_vision")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        supports_streaming: body
+            .get("supports_streaming")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true),
+        aliases: vec![],
+    };
+
+    let mut catalog = state
+        .kernel
+        .model_catalog
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+
+    if !catalog.add_custom_model(entry) {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": format!("Model '{}' already exists", id)})),
+        );
+    }
+
+    // Persist to disk
+    let custom_path = state.kernel.config.home_dir.join("custom_models.json");
+    if let Err(e) = catalog.save_custom_models(&custom_path) {
+        tracing::warn!("Failed to persist custom models: {e}");
+    }
+
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "id": id,
+            "provider": provider,
+            "status": "added"
+        })),
+    )
+}
+
+/// DELETE /api/models/custom/{id} — Remove a custom model.
+pub async fn remove_custom_model(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(model_id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let mut catalog = state
+        .kernel
+        .model_catalog
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+
+    if !catalog.remove_custom_model(&model_id) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("Custom model '{}' not found", model_id)})),
+        );
+    }
+
+    let custom_path = state.kernel.config.home_dir.join("custom_models.json");
+    if let Err(e) = catalog.save_custom_models(&custom_path) {
+        tracing::warn!("Failed to persist custom models: {e}");
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"status": "removed"})),
     )
 }
 
@@ -6418,7 +5783,6 @@ pub async fn mcp_http(
             Some(&state.kernel.mcp_connections),
             Some(&state.kernel.web_ctx),
             Some(&state.kernel.browser_ctx),
-            Some(&state.kernel.scraper_ctx),
             None,
             None,
             Some(&state.kernel.media_engine),
@@ -6568,6 +5932,32 @@ pub async fn reset_session(
     }
 }
 
+/// DELETE /api/agents/{id}/history — Clear ALL conversation history for an agent.
+pub async fn clear_agent_history(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let agent_id: AgentId = match id.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid agent ID"})),
+            )
+        }
+    };
+    match state.kernel.clear_agent_history(agent_id) {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "ok", "message": "All history cleared"})),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("{e}")})),
+        ),
+    }
+}
+
 /// POST /api/agents/{id}/session/compact — Trigger LLM session compaction.
 pub async fn compact_session(
     State(state): State<Arc<AppState>>,
@@ -6652,6 +6042,92 @@ pub async fn set_model(
         Ok(()) => (
             StatusCode::OK,
             Json(serde_json::json!({"status": "ok", "model": model})),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("{e}")})),
+        ),
+    }
+}
+
+/// GET /api/agents/{id}/tools — Get an agent's tool allowlist/blocklist.
+pub async fn get_agent_tools(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let agent_id: AgentId = match id.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid agent ID"})),
+            )
+        }
+    };
+    let entry = match state.kernel.registry.get(agent_id) {
+        Some(e) => e,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Agent not found"})),
+            )
+        }
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "tool_allowlist": entry.manifest.tool_allowlist,
+            "tool_blocklist": entry.manifest.tool_blocklist,
+        })),
+    )
+}
+
+/// PUT /api/agents/{id}/tools — Update an agent's tool allowlist/blocklist.
+pub async fn set_agent_tools(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let agent_id: AgentId = match id.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid agent ID"})),
+            )
+        }
+    };
+    let allowlist = body
+        .get("tool_allowlist")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect::<Vec<_>>()
+        });
+    let blocklist = body
+        .get("tool_blocklist")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect::<Vec<_>>()
+        });
+
+    if allowlist.is_none() && blocklist.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Provide 'tool_allowlist' and/or 'tool_blocklist'"})),
+        );
+    }
+
+    match state
+        .kernel
+        .set_agent_tool_filters(agent_id, allowlist, blocklist)
+    {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "ok"})),
         ),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -6970,14 +6446,25 @@ pub async fn test_provider(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    let (env_var, base_url, key_required) = {
+    let (env_var, base_url, key_required, default_model) = {
         let catalog = state
             .kernel
             .model_catalog
             .read()
             .unwrap_or_else(|e| e.into_inner());
         match catalog.get_provider(&name) {
-            Some(p) => (p.api_key_env.clone(), p.base_url.clone(), p.key_required),
+            Some(p) => {
+                // Find a default model for this provider to use in the test request
+                let model_id = catalog
+                    .default_model_for_provider(&name)
+                    .unwrap_or_default();
+                (
+                    p.api_key_env.clone(),
+                    p.base_url.clone(),
+                    p.key_required,
+                    model_id,
+                )
+            }
             None => {
                 return (
                     StatusCode::NOT_FOUND,
@@ -7012,7 +6499,7 @@ pub async fn test_provider(
         Ok(driver) => {
             // Send a minimal completion request to test connectivity
             let test_req = openfang_runtime::llm_driver::CompletionRequest {
-                model: String::new(), // Driver will use default
+                model: default_model.clone(),
                 messages: vec![openfang_types::message::Message::user("Hi")],
                 tools: vec![],
                 max_tokens: 1,
@@ -7103,24 +6590,9 @@ pub async fn set_provider_url(
         catalog.set_provider_url(&name, &base_url);
     }
 
-    // Persist to config.toml [provider_urls] section via atomic writer
-    let name_for_write = name.clone();
-    let base_url_for_write = base_url.clone();
-    if let Err(e) = mutate_config_table(&state, move |root| {
-        let entry = root
-            .entry("provider_urls".to_string())
-            .or_insert_with(|| toml::Value::Table(toml::value::Table::new()));
-        let urls_table = entry
-            .as_table_mut()
-            .ok_or_else(|| "provider_urls is not a table".to_string())?;
-        urls_table.insert(
-            name_for_write.clone(),
-            toml::Value::String(base_url_for_write.clone()),
-        );
-        Ok(())
-    })
-    .await
-    {
+    // Persist to config.toml [provider_urls] section
+    let config_path = state.kernel.config.home_dir.join("config.toml");
+    if let Err(e) = upsert_provider_url(&config_path, &name, &base_url) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": format!("Failed to save config: {e}")})),
@@ -7131,16 +6603,66 @@ pub async fn set_provider_url(
     let probe =
         openfang_runtime::provider_health::probe_provider(&name, &base_url).await;
 
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "status": "saved",
-            "provider": name,
-            "base_url": base_url,
-            "reachable": probe.reachable,
-            "latency_ms": probe.latency_ms,
-        })),
-    )
+    // Merge discovered models into catalog
+    if !probe.discovered_models.is_empty() {
+        if let Ok(mut catalog) = state.kernel.model_catalog.write() {
+            catalog.merge_discovered_models(&name, &probe.discovered_models);
+        }
+    }
+
+    let mut resp = serde_json::json!({
+        "status": "saved",
+        "provider": name,
+        "base_url": base_url,
+        "reachable": probe.reachable,
+        "latency_ms": probe.latency_ms,
+    });
+    if !probe.discovered_models.is_empty() {
+        resp["discovered_models"] = serde_json::json!(probe.discovered_models);
+    }
+
+    (StatusCode::OK, Json(resp))
+}
+
+/// Upsert a provider URL in the `[provider_urls]` section of config.toml.
+fn upsert_provider_url(
+    config_path: &std::path::Path,
+    provider: &str,
+    url: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let content = if config_path.exists() {
+        std::fs::read_to_string(config_path)?
+    } else {
+        String::new()
+    };
+
+    let mut doc: toml::Value = if content.trim().is_empty() {
+        toml::Value::Table(toml::map::Map::new())
+    } else {
+        toml::from_str(&content)?
+    };
+
+    let root = doc.as_table_mut().ok_or("Config is not a TOML table")?;
+
+    if !root.contains_key("provider_urls") {
+        root.insert(
+            "provider_urls".to_string(),
+            toml::Value::Table(toml::map::Map::new()),
+        );
+    }
+    let urls_table = root
+        .get_mut("provider_urls")
+        .and_then(|v| v.as_table_mut())
+        .ok_or("provider_urls is not a table")?;
+
+    urls_table.insert(provider.to_string(), toml::Value::String(url.to_string()));
+
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    std::fs::write(config_path, toml::to_string_pretty(&doc)?)?;
+    Ok(())
 }
 
 /// POST /api/skills/create — Create a local prompt-only skill.
@@ -7277,6 +6799,94 @@ fn remove_secret_env(path: &std::path::Path, key: &str) -> Result<(), std::io::E
 
     std::fs::write(path, lines.join("\n") + "\n")?;
 
+    Ok(())
+}
+
+// ── Config.toml channel management helpers ──────────────────────────
+
+/// Upsert a `[channels.<name>]` section in config.toml with the given non-secret fields.
+fn upsert_channel_config(
+    config_path: &std::path::Path,
+    channel_name: &str,
+    fields: &HashMap<String, (String, FieldType)>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let content = if config_path.exists() {
+        std::fs::read_to_string(config_path)?
+    } else {
+        String::new()
+    };
+
+    let mut doc: toml::Value = if content.trim().is_empty() {
+        toml::Value::Table(toml::map::Map::new())
+    } else {
+        toml::from_str(&content)?
+    };
+
+    let root = doc.as_table_mut().ok_or("Config is not a TOML table")?;
+
+    // Ensure [channels] table exists
+    if !root.contains_key("channels") {
+        root.insert(
+            "channels".to_string(),
+            toml::Value::Table(toml::map::Map::new()),
+        );
+    }
+    let channels_table = root
+        .get_mut("channels")
+        .and_then(|v| v.as_table_mut())
+        .ok_or("channels is not a table")?;
+
+    // Build channel sub-table with correct TOML types
+    let mut ch_table = toml::map::Map::new();
+    for (k, (v, ft)) in fields {
+        let toml_val = match ft {
+            FieldType::Number => {
+                if let Ok(n) = v.parse::<i64>() {
+                    toml::Value::Integer(n)
+                } else {
+                    toml::Value::String(v.clone())
+                }
+            }
+            _ => toml::Value::String(v.clone()),
+        };
+        ch_table.insert(k.clone(), toml_val);
+    }
+    channels_table.insert(channel_name.to_string(), toml::Value::Table(ch_table));
+
+    // Ensure parent directory exists
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    std::fs::write(config_path, toml::to_string_pretty(&doc)?)?;
+    Ok(())
+}
+
+/// Remove a `[channels.<name>]` section from config.toml.
+fn remove_channel_config(
+    config_path: &std::path::Path,
+    channel_name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !config_path.exists() {
+        return Ok(());
+    }
+
+    let content = std::fs::read_to_string(config_path)?;
+    if content.trim().is_empty() {
+        return Ok(());
+    }
+
+    let mut doc: toml::Value = toml::from_str(&content)?;
+
+    if let Some(channels) = doc
+        .as_table_mut()
+        .and_then(|r| r.get_mut("channels"))
+        .and_then(|c| c.as_table_mut())
+    {
+        channels.remove(channel_name);
+    }
+
+    std::fs::write(config_path, toml::to_string_pretty(&doc)?)?;
     Ok(())
 }
 
@@ -7617,6 +7227,29 @@ pub async fn create_schedule(
     }
 
     let agent_id_str = req["agent_id"].as_str().unwrap_or("").to_string();
+    if agent_id_str.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Missing required field: agent_id"})),
+        );
+    }
+    // Validate agent exists (UUID or name lookup)
+    let agent_exists = if let Ok(aid) = agent_id_str.parse::<AgentId>() {
+        state.kernel.registry.get(aid).is_some()
+    } else {
+        state
+            .kernel
+            .registry
+            .list()
+            .iter()
+            .any(|a| a.name == agent_id_str)
+    };
+    if !agent_exists {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("Agent not found: {agent_id_str}")})),
+        );
+    }
     let message = req["message"].as_str().unwrap_or("").to_string();
     let enabled = req.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
 
@@ -7790,10 +7423,14 @@ pub async fn run_schedule(
         .unwrap_or("Scheduled task triggered manually.");
     let name = schedule["name"].as_str().unwrap_or("(unnamed)");
 
-    // Find the target agent
+    // Find the target agent — require explicit agent_id, no silent fallback
     let target_agent = if !agent_id_str.is_empty() {
         if let Ok(aid) = agent_id_str.parse::<AgentId>() {
-            Some(aid)
+            if state.kernel.registry.get(aid).is_some() {
+                Some(aid)
+            } else {
+                None
+            }
         } else {
             state
                 .kernel
@@ -7804,7 +7441,7 @@ pub async fn run_schedule(
                 .map(|a| a.id)
         }
     } else {
-        state.kernel.registry.list().first().map(|a| a.id)
+        None
     };
 
     let target_agent = match target_agent {
@@ -7845,7 +7482,8 @@ pub async fn run_schedule(
         serde_json::Value::Array(schedules_updated),
     );
 
-    match state.kernel.send_message(target_agent, &run_message).await {
+    let kernel_handle: Arc<dyn KernelHandle> = state.kernel.clone() as Arc<dyn KernelHandle>;
+    match state.kernel.send_message_with_handle(target_agent, &run_message, Some(kernel_handle)).await {
         Ok(result) => (
             StatusCode::OK,
             Json(serde_json::json!({
@@ -7949,7 +7587,7 @@ pub async fn update_agent_identity(
 // Agent Config Hot-Update
 // ---------------------------------------------------------------------------
 
-/// Request body for patching agent config (name, description, prompt, identity).
+/// Request body for patching agent config (name, description, prompt, identity, model).
 #[derive(serde::Deserialize)]
 pub struct PatchAgentConfigRequest {
     pub name: Option<String>,
@@ -7961,6 +7599,10 @@ pub struct PatchAgentConfigRequest {
     pub archetype: Option<String>,
     pub vibe: Option<String>,
     pub greeting_style: Option<String>,
+    pub model: Option<String>,
+    pub provider: Option<String>,
+    pub api_key_env: Option<String>,
+    pub base_url: Option<String>,
 }
 
 /// PATCH /api/agents/{id}/config — Hot-update agent name, description, system prompt, and identity.
@@ -8113,6 +7755,58 @@ pub async fn patch_agent_config(
                 StatusCode::NOT_FOUND,
                 Json(serde_json::json!({"error": "Agent not found"})),
             );
+        }
+    }
+
+    // Update model/provider
+    if let Some(ref new_model) = req.model {
+        if !new_model.is_empty() {
+            if let Some(ref new_provider) = req.provider {
+                if !new_provider.is_empty() {
+                    if state
+                        .kernel
+                        .registry
+                        .update_model_and_provider(
+                            agent_id,
+                            new_model.clone(),
+                            new_provider.clone(),
+                        )
+                        .is_err()
+                    {
+                        return (
+                            StatusCode::NOT_FOUND,
+                            Json(serde_json::json!({"error": "Agent not found"})),
+                        );
+                    }
+                } else if state
+                    .kernel
+                    .registry
+                    .update_model(agent_id, new_model.clone())
+                    .is_err()
+                {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(serde_json::json!({"error": "Agent not found"})),
+                    );
+                }
+            } else if state
+                .kernel
+                .registry
+                .update_model(agent_id, new_model.clone())
+                .is_err()
+            {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": "Agent not found"})),
+                );
+            }
+        }
+    }
+
+    // Persist updated manifest to database so changes survive restart
+    if let Some(entry) = state.kernel.registry.get(agent_id) {
+        if let Err(e) = state.kernel.memory.save_agent(&entry) {
+            tracing::warn!("Failed to persist agent config update: {e}");
         }
     }
 
@@ -8929,7 +8623,19 @@ pub async fn config_reload(State(state): State<Arc<AppState>>) -> impl IntoRespo
 // ---------------------------------------------------------------------------
 
 /// GET /api/config/schema — Return a simplified JSON description of the config structure.
-pub async fn config_schema() -> impl IntoResponse {
+pub async fn config_schema(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    // Build provider/model options from model catalog for dropdowns
+    let catalog = state.kernel.model_catalog.read().unwrap_or_else(|e| e.into_inner());
+    let provider_options: Vec<String> = catalog.list_providers().iter().map(|p| p.id.clone()).collect();
+    let model_options: Vec<serde_json::Value> = catalog
+        .list_models()
+        .iter()
+        .map(|m| serde_json::json!({"id": m.id, "name": m.display_name, "provider": m.provider}))
+        .collect();
+    drop(catalog);
+
     Json(serde_json::json!({
         "sections": {
             "api": {
@@ -8940,9 +8646,10 @@ pub async fn config_schema() -> impl IntoResponse {
                 }
             },
             "default_model": {
+                "hot_reloadable": true,
                 "fields": {
-                    "provider": "string",
-                    "model": "string",
+                    "provider": { "type": "select", "options": provider_options },
+                    "model": { "type": "select", "options": model_options },
                     "api_key_env": "string",
                     "base_url": "string"
                 }
@@ -9036,54 +8743,74 @@ pub async fn config_set(
         }
     };
 
+    let config_path = state.kernel.config.home_dir.join("config.toml");
+
+    // Read existing config as a TOML table, or start fresh
+    let mut table: toml::value::Table = if config_path.exists() {
+        match std::fs::read_to_string(&config_path) {
+            Ok(content) => toml::from_str(&content).unwrap_or_default(),
+            Err(_) => toml::value::Table::new(),
+        }
+    } else {
+        toml::value::Table::new()
+    };
+
     // Convert JSON value to TOML value
     let toml_val = json_to_toml_value(&value);
 
-    let path_for_write = path.clone();
-    let write_result = mutate_config_table(&state, move |table| {
-        let parts: Vec<&str> = path_for_write.split('.').collect();
-        match parts.len() {
-            1 => {
-                table.insert(parts[0].to_string(), toml_val);
-            }
-            2 => {
-                let section = table
-                    .entry(parts[0].to_string())
-                    .or_insert_with(|| toml::Value::Table(toml::value::Table::new()));
-                if let toml::Value::Table(ref mut t) = section {
-                    t.insert(parts[1].to_string(), toml_val);
-                }
-            }
-            3 => {
-                let section = table
-                    .entry(parts[0].to_string())
-                    .or_insert_with(|| toml::Value::Table(toml::value::Table::new()));
-                if let toml::Value::Table(ref mut t) = section {
-                    let sub = t
-                        .entry(parts[1].to_string())
-                        .or_insert_with(|| toml::Value::Table(toml::value::Table::new()));
-                    if let toml::Value::Table(ref mut t2) = sub {
-                        t2.insert(parts[2].to_string(), toml_val);
-                    }
-                }
-            }
-            _ => {
-                return Err("path too deep (max 3 levels)".to_string());
+    // Parse "section.key" path and set value
+    let parts: Vec<&str> = path.split('.').collect();
+    match parts.len() {
+        1 => {
+            table.insert(parts[0].to_string(), toml_val);
+        }
+        2 => {
+            let section = table
+                .entry(parts[0].to_string())
+                .or_insert_with(|| toml::Value::Table(toml::value::Table::new()));
+            if let toml::Value::Table(ref mut t) = section {
+                t.insert(parts[1].to_string(), toml_val);
             }
         }
-        Ok(())
-    })
-    .await;
+        3 => {
+            let section = table
+                .entry(parts[0].to_string())
+                .or_insert_with(|| toml::Value::Table(toml::value::Table::new()));
+            if let toml::Value::Table(ref mut t) = section {
+                let sub = t
+                    .entry(parts[1].to_string())
+                    .or_insert_with(|| toml::Value::Table(toml::value::Table::new()));
+                if let toml::Value::Table(ref mut t2) = sub {
+                    t2.insert(parts[2].to_string(), toml_val);
+                }
+            }
+        }
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(
+                    serde_json::json!({"status": "error", "error": "path too deep (max 3 levels)"}),
+                ),
+            );
+        }
+    }
 
-    if let Err(e) = write_result {
-        let status = if e.contains("path too deep") {
-            StatusCode::BAD_REQUEST
-        } else {
-            StatusCode::INTERNAL_SERVER_ERROR
-        };
+    // Write back
+    let toml_string = match toml::to_string_pretty(&table) {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(
+                    serde_json::json!({"status": "error", "error": format!("serialize failed: {e}")}),
+                ),
+            );
+        }
+    };
+    if let Err(e) = std::fs::write(&config_path, &toml_string) {
         return (
-            status,
-            Json(serde_json::json!({"status": "error", "error": e})),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"status": "error", "error": format!("write failed: {e}")})),
         );
     }
 
@@ -9117,7 +8844,9 @@ fn json_to_toml_value(value: &serde_json::Value) -> toml::Value {
     match value {
         serde_json::Value::String(s) => toml::Value::String(s.clone()),
         serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
+            if let Some(i) = n.as_u64() {
+                toml::Value::Integer(i as i64)
+            } else if let Some(i) = n.as_i64() {
                 toml::Value::Integer(i)
             } else if let Some(f) = n.as_f64() {
                 toml::Value::Float(f)
@@ -9721,46 +9450,537 @@ fn validate_webhook_token(headers: &axum::http::HeaderMap, token_env: &str) -> b
     provided.as_bytes().ct_eq(expected.as_bytes()).into()
 }
 
-#[cfg(test)]
-mod model_helpers_tests {
-    use super::{
-        compute_custom_openrouter_status, normalize_custom_model_status,
-        normalize_openrouter_model_input,
+// ══════════════════════════════════════════════════════════════════════
+// GitHub Copilot OAuth Device Flow
+// ══════════════════════════════════════════════════════════════════════
+
+/// State for an in-progress device flow.
+struct CopilotFlowState {
+    device_code: String,
+    interval: u64,
+    expires_at: Instant,
+}
+
+/// Active device flows, keyed by poll_id. Auto-expire after the flow's TTL.
+static COPILOT_FLOWS: LazyLock<DashMap<String, CopilotFlowState>> = LazyLock::new(DashMap::new);
+
+/// POST /api/providers/github-copilot/oauth/start
+///
+/// Initiates a GitHub device flow for Copilot authentication.
+/// Returns a user code and verification URI that the user visits in their browser.
+pub async fn copilot_oauth_start() -> impl IntoResponse {
+    // Clean up expired flows first
+    COPILOT_FLOWS.retain(|_, state| state.expires_at > Instant::now());
+
+    match openfang_runtime::copilot_oauth::start_device_flow().await {
+        Ok(resp) => {
+            let poll_id = uuid::Uuid::new_v4().to_string();
+
+            COPILOT_FLOWS.insert(
+                poll_id.clone(),
+                CopilotFlowState {
+                    device_code: resp.device_code,
+                    interval: resp.interval,
+                    expires_at: Instant::now()
+                        + std::time::Duration::from_secs(resp.expires_in),
+                },
+            );
+
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "user_code": resp.user_code,
+                    "verification_uri": resp.verification_uri,
+                    "poll_id": poll_id,
+                    "expires_in": resp.expires_in,
+                    "interval": resp.interval,
+                })),
+            )
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e })),
+        ),
+    }
+}
+
+/// GET /api/providers/github-copilot/oauth/poll/{poll_id}
+///
+/// Poll the status of a GitHub device flow.
+/// Returns `pending`, `complete`, `expired`, `denied`, or `error`.
+/// On `complete`, saves the token to secrets.env and sets GITHUB_TOKEN.
+pub async fn copilot_oauth_poll(
+    State(state): State<Arc<AppState>>,
+    Path(poll_id): Path<String>,
+) -> impl IntoResponse {
+    let flow = match COPILOT_FLOWS.get(&poll_id) {
+        Some(f) => f,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"status": "not_found", "error": "Unknown poll_id"})),
+            )
+        }
     };
 
-    #[test]
-    fn normalize_openrouter_input_accepts_raw_and_prefixed() {
-        assert_eq!(
-            normalize_openrouter_model_input("z-ai/glm-5").as_deref(),
-            Some("z-ai/glm-5")
-        );
-        assert_eq!(
-            normalize_openrouter_model_input("openrouter/z-ai/glm-5").as_deref(),
-            Some("z-ai/glm-5")
+    if flow.expires_at <= Instant::now() {
+        drop(flow);
+        COPILOT_FLOWS.remove(&poll_id);
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "expired"})),
         );
     }
 
-    #[test]
-    fn normalize_openrouter_input_rejects_whitespace() {
-        assert!(normalize_openrouter_model_input("openrouter/z-ai/ glm-5").is_none());
-        assert!(normalize_openrouter_model_input("z-ai /glm-5").is_none());
-        assert!(normalize_openrouter_model_input("").is_none());
+    let device_code = flow.device_code.clone();
+    drop(flow);
+
+    match openfang_runtime::copilot_oauth::poll_device_flow(&device_code).await {
+        openfang_runtime::copilot_oauth::DeviceFlowStatus::Pending => (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "pending"})),
+        ),
+        openfang_runtime::copilot_oauth::DeviceFlowStatus::Complete { access_token } => {
+            // Save to secrets.env
+            let secrets_path = state.kernel.config.home_dir.join("secrets.env");
+            if let Err(e) = write_secret_env(&secrets_path, "GITHUB_TOKEN", &access_token) {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"status": "error", "error": format!("Failed to save token: {e}")})),
+                );
+            }
+
+            // Set in current process
+            std::env::set_var("GITHUB_TOKEN", access_token.as_str());
+
+            // Refresh auth detection
+            state
+                .kernel
+                .model_catalog
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .detect_auth();
+
+            // Clean up flow state
+            COPILOT_FLOWS.remove(&poll_id);
+
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"status": "complete"})),
+            )
+        }
+        openfang_runtime::copilot_oauth::DeviceFlowStatus::SlowDown { new_interval } => {
+            // Update interval
+            if let Some(mut f) = COPILOT_FLOWS.get_mut(&poll_id) {
+                f.interval = new_interval;
+            }
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"status": "pending", "interval": new_interval})),
+            )
+        }
+        openfang_runtime::copilot_oauth::DeviceFlowStatus::Expired => {
+            COPILOT_FLOWS.remove(&poll_id);
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"status": "expired"})),
+            )
+        }
+        openfang_runtime::copilot_oauth::DeviceFlowStatus::AccessDenied => {
+            COPILOT_FLOWS.remove(&poll_id);
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"status": "denied"})),
+            )
+        }
+        openfang_runtime::copilot_oauth::DeviceFlowStatus::Error(e) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "error", "error": e})),
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Agent Communication (Comms) endpoints
+// ---------------------------------------------------------------------------
+
+/// GET /api/comms/topology — Build agent topology graph from registry.
+pub async fn comms_topology(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    use openfang_types::comms::{EdgeKind, TopoEdge, TopoNode, Topology};
+
+    let agents = state.kernel.registry.list();
+
+    let nodes: Vec<TopoNode> = agents
+        .iter()
+        .map(|e| TopoNode {
+            id: e.id.to_string(),
+            name: e.name.clone(),
+            state: format!("{:?}", e.state),
+            model: e.manifest.model.model.clone(),
+        })
+        .collect();
+
+    let mut edges: Vec<TopoEdge> = Vec::new();
+
+    // Parent-child edges from registry
+    for agent in &agents {
+        for child_id in &agent.children {
+            edges.push(TopoEdge {
+                from: agent.id.to_string(),
+                to: child_id.to_string(),
+                kind: EdgeKind::ParentChild,
+            });
+        }
     }
 
-    #[test]
-    fn custom_status_transition_verified_to_stale_when_missing() {
-        assert_eq!(
-            compute_custom_openrouter_status("verified", false),
-            "stale".to_string()
+    // Peer message edges from event bus history
+    let events = state.kernel.event_bus.history(500).await;
+    let mut peer_pairs = std::collections::HashSet::new();
+    for event in &events {
+        if let openfang_types::event::EventPayload::Message(_) = &event.payload {
+            if let openfang_types::event::EventTarget::Agent(target_id) = &event.target {
+                let from = event.source.to_string();
+                let to = target_id.to_string();
+                // Deduplicate: only one edge per pair, skip self-loops
+                if from != to {
+                    let key = if from < to {
+                        (from.clone(), to.clone())
+                    } else {
+                        (to.clone(), from.clone())
+                    };
+                    if peer_pairs.insert(key) {
+                        edges.push(TopoEdge {
+                            from,
+                            to,
+                            kind: EdgeKind::Peer,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    Json(serde_json::to_value(Topology { nodes, edges }).unwrap_or_default())
+}
+
+/// Filter a kernel event into a CommsEvent, if it represents inter-agent communication.
+fn filter_to_comms_event(
+    event: &openfang_types::event::Event,
+    agents: &[openfang_types::agent::AgentEntry],
+) -> Option<openfang_types::comms::CommsEvent> {
+    use openfang_types::comms::{CommsEvent, CommsEventKind};
+    use openfang_types::event::{EventPayload, EventTarget, LifecycleEvent};
+
+    let resolve_name = |id: &str| -> String {
+        agents
+            .iter()
+            .find(|a| a.id.to_string() == id)
+            .map(|a| a.name.clone())
+            .unwrap_or_else(|| id.to_string())
+    };
+
+    match &event.payload {
+        EventPayload::Message(msg) => {
+            let target_id = match &event.target {
+                EventTarget::Agent(id) => id.to_string(),
+                _ => String::new(),
+            };
+            Some(CommsEvent {
+                id: event.id.to_string(),
+                timestamp: event.timestamp.to_rfc3339(),
+                kind: CommsEventKind::AgentMessage,
+                source_id: event.source.to_string(),
+                source_name: resolve_name(&event.source.to_string()),
+                target_id: target_id.clone(),
+                target_name: resolve_name(&target_id),
+                detail: openfang_types::truncate_str(&msg.content, 200).to_string(),
+            })
+        }
+        EventPayload::Lifecycle(lifecycle) => match lifecycle {
+            LifecycleEvent::Spawned { agent_id, name } => Some(CommsEvent {
+                id: event.id.to_string(),
+                timestamp: event.timestamp.to_rfc3339(),
+                kind: CommsEventKind::AgentSpawned,
+                source_id: event.source.to_string(),
+                source_name: resolve_name(&event.source.to_string()),
+                target_id: agent_id.to_string(),
+                target_name: name.clone(),
+                detail: format!("Agent '{}' spawned", name),
+            }),
+            LifecycleEvent::Terminated { agent_id, reason } => Some(CommsEvent {
+                id: event.id.to_string(),
+                timestamp: event.timestamp.to_rfc3339(),
+                kind: CommsEventKind::AgentTerminated,
+                source_id: event.source.to_string(),
+                source_name: resolve_name(&event.source.to_string()),
+                target_id: agent_id.to_string(),
+                target_name: resolve_name(&agent_id.to_string()),
+                detail: format!("Terminated: {}", reason),
+            }),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Convert an audit entry into a CommsEvent if it represents inter-agent activity.
+fn audit_to_comms_event(
+    entry: &openfang_runtime::audit::AuditEntry,
+    agents: &[openfang_types::agent::AgentEntry],
+) -> Option<openfang_types::comms::CommsEvent> {
+    use openfang_types::comms::{CommsEvent, CommsEventKind};
+
+    let resolve_name = |id: &str| -> String {
+        agents
+            .iter()
+            .find(|a| a.id.to_string() == id)
+            .map(|a| a.name.clone())
+            .unwrap_or_else(|| {
+                if id.is_empty() || id == "system" {
+                    "system".to_string()
+                } else {
+                    openfang_types::truncate_str(id, 12).to_string()
+                }
+            })
+    };
+
+    let action_str = format!("{:?}", entry.action);
+    let (kind, detail, target_label) = match action_str.as_str() {
+        "AgentMessage" => {
+            // Format detail: "tokens_in=X, tokens_out=Y" → readable summary
+            let detail = if entry.detail.starts_with("tokens_in=") {
+                let parts: Vec<&str> = entry.detail.split(", ").collect();
+                let in_tok = parts.first().and_then(|p| p.strip_prefix("tokens_in=")).unwrap_or("?");
+                let out_tok = parts.get(1).and_then(|p| p.strip_prefix("tokens_out=")).unwrap_or("?");
+                if entry.outcome == "ok" {
+                    format!("{} in / {} out tokens", in_tok, out_tok)
+                } else {
+                    format!("{} in / {} out — {}", in_tok, out_tok, openfang_types::truncate_str(&entry.outcome, 80))
+                }
+            } else if entry.outcome != "ok" {
+                format!("{} — {}", openfang_types::truncate_str(&entry.detail, 80), openfang_types::truncate_str(&entry.outcome, 80))
+            } else {
+                openfang_types::truncate_str(&entry.detail, 200).to_string()
+            };
+            (CommsEventKind::AgentMessage, detail, "user")
+        }
+        "AgentSpawn" => (
+            CommsEventKind::AgentSpawned,
+            format!("Agent spawned: {}", openfang_types::truncate_str(&entry.detail, 100)),
+            "",
+        ),
+        "AgentKill" => (
+            CommsEventKind::AgentTerminated,
+            format!("Agent killed: {}", openfang_types::truncate_str(&entry.detail, 100)),
+            "",
+        ),
+        _ => return None,
+    };
+
+    Some(CommsEvent {
+        id: format!("audit-{}", entry.seq),
+        timestamp: entry.timestamp.clone(),
+        kind,
+        source_id: entry.agent_id.clone(),
+        source_name: resolve_name(&entry.agent_id),
+        target_id: if target_label.is_empty() { String::new() } else { target_label.to_string() },
+        target_name: if target_label.is_empty() { String::new() } else { target_label.to_string() },
+        detail,
+    })
+}
+
+/// GET /api/comms/events — Return recent inter-agent communication events.
+///
+/// Sources from both the event bus (for lifecycle events with full context)
+/// and the audit log (for message/spawn/kill events that are always captured).
+pub async fn comms_events(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let limit = params
+        .get("limit")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(100)
+        .min(500);
+
+    let agents = state.kernel.registry.list();
+
+    // Primary source: event bus (has full source/target context)
+    let bus_events = state.kernel.event_bus.history(500).await;
+    let mut comms_events: Vec<openfang_types::comms::CommsEvent> = bus_events
+        .iter()
+        .filter_map(|e| filter_to_comms_event(e, &agents))
+        .collect();
+
+    // Secondary source: audit log (always populated, wider coverage)
+    let audit_entries = state.kernel.audit_log.recent(500);
+    let seen_ids: std::collections::HashSet<String> =
+        comms_events.iter().map(|e| e.id.clone()).collect();
+
+    for entry in audit_entries.iter().rev() {
+        if let Some(ev) = audit_to_comms_event(entry, &agents) {
+            if !seen_ids.contains(&ev.id) {
+                comms_events.push(ev);
+            }
+        }
+    }
+
+    // Sort by timestamp descending (newest first)
+    comms_events.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    comms_events.truncate(limit);
+
+    Json(comms_events)
+}
+
+/// GET /api/comms/events/stream — SSE stream of inter-agent communication events.
+///
+/// Polls the audit log every 500ms for new inter-agent events.
+pub async fn comms_events_stream(
+    State(state): State<Arc<AppState>>,
+) -> axum::response::Response {
+    use axum::response::sse::{Event, KeepAlive, Sse};
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<
+        Result<axum::response::sse::Event, std::convert::Infallible>,
+    >(256);
+
+    tokio::spawn(async move {
+        let mut last_seq: u64 = {
+            let entries = state.kernel.audit_log.recent(1);
+            entries.last().map(|e| e.seq).unwrap_or(0)
+        };
+
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+            let agents = state.kernel.registry.list();
+            let entries = state.kernel.audit_log.recent(50);
+
+            for entry in &entries {
+                if entry.seq <= last_seq {
+                    continue;
+                }
+                if let Some(comms_event) = audit_to_comms_event(entry, &agents) {
+                    let data = serde_json::to_string(&comms_event).unwrap_or_default();
+                    if tx.send(Ok(Event::default().data(data))).await.is_err() {
+                        return; // Client disconnected
+                    }
+                }
+            }
+
+            if let Some(last) = entries.last() {
+                last_seq = last.seq;
+            }
+        }
+    });
+
+    let rx_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+    Sse::new(rx_stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(std::time::Duration::from_secs(15))
+                .text("ping"),
+        )
+        .into_response()
+}
+
+/// POST /api/comms/send — Send a message from one agent to another.
+pub async fn comms_send(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<openfang_types::comms::CommsSendRequest>,
+) -> impl IntoResponse {
+    // Validate from agent exists
+    let from_id: openfang_types::agent::AgentId = match req.from_agent_id.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid from_agent_id"})),
+            )
+        }
+    };
+    if state.kernel.registry.get(from_id).is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Source agent not found"})),
         );
     }
 
-    #[test]
-    fn custom_status_transition_unverified_to_verified_when_present() {
-        assert_eq!(
-            compute_custom_openrouter_status("unverified", true),
-            "verified".to_string()
+    // Validate to agent exists
+    let to_id: openfang_types::agent::AgentId = match req.to_agent_id.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid to_agent_id"})),
+            )
+        }
+    };
+    if state.kernel.registry.get(to_id).is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Target agent not found"})),
         );
-        assert_eq!(normalize_custom_model_status("unknown"), "unverified");
+    }
+
+    // SECURITY: Limit message size
+    if req.message.len() > 64 * 1024 {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({"error": "Message too large (max 64KB)"})),
+        );
+    }
+
+    match state.kernel.send_message(to_id, &req.message).await {
+        Ok(result) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "response": result.response,
+                "input_tokens": result.total_usage.input_tokens,
+                "output_tokens": result.total_usage.output_tokens,
+            })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Message delivery failed: {e}")})),
+        ),
+    }
+}
+
+/// POST /api/comms/task — Post a task to the agent task queue.
+pub async fn comms_task(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<openfang_types::comms::CommsTaskRequest>,
+) -> impl IntoResponse {
+    if req.title.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Title is required"})),
+        );
+    }
+
+    match state
+        .kernel
+        .memory
+        .task_post(
+            &req.title,
+            &req.description,
+            req.assigned_to.as_deref(),
+            Some("ui-user"),
+        )
+        .await
+    {
+        Ok(task_id) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({
+                "ok": true,
+                "task_id": task_id,
+            })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to post task: {e}")})),
+        ),
     }
 }

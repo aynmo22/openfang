@@ -38,7 +38,7 @@ pub struct SettingStatus {
 /// The Hand registry — stores definitions and tracks active instances.
 pub struct HandRegistry {
     /// All known hand definitions, keyed by hand_id.
-    definitions: HashMap<String, HandDefinition>,
+    definitions: DashMap<String, HandDefinition>,
     /// Active hand instances, keyed by instance UUID.
     instances: DashMap<Uuid, HandInstance>,
 }
@@ -47,13 +47,13 @@ impl HandRegistry {
     /// Create an empty registry.
     pub fn new() -> Self {
         Self {
-            definitions: HashMap::new(),
+            definitions: DashMap::new(),
             instances: DashMap::new(),
         }
     }
 
     /// Load all bundled hand definitions. Returns count of definitions loaded.
-    pub fn load_bundled(&mut self) -> usize {
+    pub fn load_bundled(&self) -> usize {
         let bundled = bundled::bundled_hands();
         let mut count = 0;
         for (id, toml_content, skill_content) in bundled {
@@ -71,16 +71,60 @@ impl HandRegistry {
         count
     }
 
+    /// Install a hand from a directory containing HAND.toml (and optional SKILL.md).
+    pub fn install_from_path(&self, path: &std::path::Path) -> HandResult<HandDefinition> {
+        let toml_path = path.join("HAND.toml");
+        let skill_path = path.join("SKILL.md");
+
+        let toml_content = std::fs::read_to_string(&toml_path).map_err(|e| {
+            HandError::NotFound(format!("Cannot read {}: {e}", toml_path.display()))
+        })?;
+        let skill_content = std::fs::read_to_string(&skill_path).unwrap_or_default();
+
+        let def = bundled::parse_bundled("custom", &toml_content, &skill_content)?;
+
+        if self.definitions.contains_key(&def.id) {
+            return Err(HandError::AlreadyActive(format!(
+                "Hand '{}' already registered",
+                def.id
+            )));
+        }
+
+        info!(hand = %def.id, name = %def.name, path = %path.display(), "Installed hand from path");
+        self.definitions.insert(def.id.clone(), def.clone());
+        Ok(def)
+    }
+
+    /// Install a hand from raw TOML + skill content (for API-based installs).
+    pub fn install_from_content(
+        &self,
+        toml_content: &str,
+        skill_content: &str,
+    ) -> HandResult<HandDefinition> {
+        let def = bundled::parse_bundled("custom", toml_content, skill_content)?;
+
+        if self.definitions.contains_key(&def.id) {
+            return Err(HandError::AlreadyActive(format!(
+                "Hand '{}' already registered",
+                def.id
+            )));
+        }
+
+        info!(hand = %def.id, name = %def.name, "Installed hand from content");
+        self.definitions.insert(def.id.clone(), def.clone());
+        Ok(def)
+    }
+
     /// List all known hand definitions.
-    pub fn list_definitions(&self) -> Vec<&HandDefinition> {
-        let mut defs: Vec<&HandDefinition> = self.definitions.values().collect();
-        defs.sort_by_key(|d| &d.name);
+    pub fn list_definitions(&self) -> Vec<HandDefinition> {
+        let mut defs: Vec<HandDefinition> = self.definitions.iter().map(|r| r.value().clone()).collect();
+        defs.sort_by(|a, b| a.name.cmp(&b.name));
         defs
     }
 
     /// Get a specific hand definition by ID.
-    pub fn get_definition(&self, hand_id: &str) -> Option<&HandDefinition> {
-        self.definitions.get(hand_id)
+    pub fn get_definition(&self, hand_id: &str) -> Option<HandDefinition> {
+        self.definitions.get(hand_id).map(|r| r.value().clone())
     }
 
     /// Activate a hand — creates an instance (agent spawning is done by kernel).
@@ -230,6 +274,21 @@ impl HandRegistry {
             .collect())
     }
 
+    /// Update config for an active hand instance.
+    pub fn update_config(
+        &self,
+        instance_id: Uuid,
+        config: HashMap<String, serde_json::Value>,
+    ) -> HandResult<()> {
+        let mut entry = self
+            .instances
+            .get_mut(&instance_id)
+            .ok_or(HandError::InstanceNotFound(instance_id))?;
+        entry.config = config;
+        entry.updated_at = chrono::Utc::now();
+        Ok(())
+    }
+
     /// Mark an instance as errored.
     pub fn set_error(&self, instance_id: Uuid, message: String) -> HandResult<()> {
         let mut entry = self
@@ -329,7 +388,7 @@ mod tests {
 
     #[test]
     fn load_bundled_hands() {
-        let mut reg = HandRegistry::new();
+        let reg = HandRegistry::new();
         let count = reg.load_bundled();
         assert_eq!(count, 8);
         assert!(!reg.list_definitions().is_empty());
@@ -353,7 +412,7 @@ mod tests {
 
     #[test]
     fn activate_and_deactivate() {
-        let mut reg = HandRegistry::new();
+        let reg = HandRegistry::new();
         reg.load_bundled();
 
         let instance = reg.activate("clip", HashMap::new()).unwrap();
@@ -375,7 +434,7 @@ mod tests {
 
     #[test]
     fn pause_and_resume() {
-        let mut reg = HandRegistry::new();
+        let reg = HandRegistry::new();
         reg.load_bundled();
 
         let instance = reg.activate("clip", HashMap::new()).unwrap();
@@ -394,7 +453,7 @@ mod tests {
 
     #[test]
     fn set_agent() {
-        let mut reg = HandRegistry::new();
+        let reg = HandRegistry::new();
         reg.load_bundled();
 
         let instance = reg.activate("clip", HashMap::new()).unwrap();
@@ -412,7 +471,7 @@ mod tests {
 
     #[test]
     fn check_requirements() {
-        let mut reg = HandRegistry::new();
+        let reg = HandRegistry::new();
         reg.load_bundled();
 
         let results = reg.check_requirements("clip").unwrap();
@@ -437,7 +496,7 @@ mod tests {
 
     #[test]
     fn set_error_status() {
-        let mut reg = HandRegistry::new();
+        let reg = HandRegistry::new();
         reg.load_bundled();
 
         let instance = reg.activate("clip", HashMap::new()).unwrap();

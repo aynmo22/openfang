@@ -10,25 +10,22 @@ function settingsPage() {
     config: {},
     providers: [],
     models: [],
-    customModels: [],
-    activeModel: null,
-    modelWarnings: [],
     toolSearch: '',
     modelSearch: '',
     modelProviderFilter: '',
     modelTierFilter: '',
-    customModelInput: '',
-    customModelLabel: '',
-    customModelVerifyResult: null,
-    customModelVerifying: false,
-    customModelSaving: false,
-    customModelUseBusy: {},
-    customModelDeleteBusy: {},
+    showCustomModelForm: false,
+    customModelId: '',
+    customModelProvider: 'openrouter',
+    customModelContext: 128000,
+    customModelMaxOutput: 8192,
+    customModelStatus: '',
     providerKeyInputs: {},
     providerUrlInputs: {},
     providerUrlSaving: {},
     providerTesting: {},
     providerTestResults: {},
+    copilotOAuth: { polling: false, userCode: '', verificationUri: '', pollId: '', interval: 5 },
     loading: true,
     loadError: '',
 
@@ -222,8 +219,13 @@ function settingsPage() {
         this.providers = data.providers || [];
         for (var i = 0; i < this.providers.length; i++) {
           var p = this.providers[i];
-          if (p.is_local && p.base_url && !this.providerUrlInputs[p.id]) {
-            this.providerUrlInputs[p.id] = p.base_url;
+          if (p.is_local) {
+            if (!this.providerUrlInputs[p.id]) {
+              this.providerUrlInputs[p.id] = p.base_url || '';
+            }
+            if (this.providerUrlSaving[p.id] === undefined) {
+              this.providerUrlSaving[p.id] = false;
+            }
           }
         }
       } catch(e) { this.providers = []; }
@@ -233,14 +235,26 @@ function settingsPage() {
       try {
         var data = await OpenFangAPI.get('/api/models');
         this.models = data.models || [];
-        this.customModels = data.custom_models || [];
-        this.activeModel = data.active_model || null;
-        this.modelWarnings = data.warnings || [];
+      } catch(e) { this.models = []; }
+    },
+
+    async addCustomModel() {
+      var id = this.customModelId.trim();
+      if (!id) return;
+      this.customModelStatus = 'Adding...';
+      try {
+        await OpenFangAPI.post('/api/models/custom', {
+          id: id,
+          provider: this.customModelProvider || 'openrouter',
+          context_window: this.customModelContext || 128000,
+          max_output_tokens: this.customModelMaxOutput || 8192,
+        });
+        this.customModelStatus = 'Added!';
+        this.customModelId = '';
+        this.showCustomModelForm = false;
+        await this.loadModels();
       } catch(e) {
-        this.models = [];
-        this.customModels = [];
-        this.activeModel = null;
-        this.modelWarnings = [];
+        this.customModelStatus = 'Error: ' + (e.message || 'Failed');
       }
     },
 
@@ -311,56 +325,6 @@ function settingsPage() {
       return Object.keys(seen).sort();
     },
 
-    normalizeOpenRouterModelInput(input) {
-      if (!input) return '';
-      var trimmed = String(input).trim();
-      if (!trimmed) return '';
-      if (trimmed.indexOf('openrouter/') === 0) {
-        return trimmed.slice('openrouter/'.length).trim();
-      }
-      return trimmed;
-    },
-
-    get filteredCustomModels() {
-      var self = this;
-      var q = (self.modelSearch || '').toLowerCase().trim();
-      return (self.customModels || []).filter(function(m) {
-        if (q) {
-          var label = (m.label || '').toLowerCase();
-          var model = (m.model || '').toLowerCase();
-          var display = (m.display_id || '').toLowerCase();
-          if (label.indexOf(q) === -1 && model.indexOf(q) === -1 && display.indexOf(q) === -1) {
-            return false;
-          }
-        }
-        return true;
-      });
-    },
-
-    formatModelWarning(warning) {
-      var w = String(warning || '');
-      if (!w) return '';
-      if (w.indexOf('missing-key:') === 0) {
-        return 'OpenRouter API key is missing. Set OPENROUTER_API_KEY to verify and use OpenRouter models.';
-      }
-      if (w.indexOf('verify-failed:') === 0) {
-        return 'OpenRouter verification is currently unavailable. You can still save models as unverified.';
-      }
-      if (w.indexOf('runtime-mismatch:') === 0) {
-        return 'Runtime model differs from config. Reload or restart to fully apply model changes.';
-      }
-      if (w.indexOf('Config parse error:') === 0) {
-        return 'Config file parse error detected. The last known good runtime config is still active.';
-      }
-      if (w.indexOf('Config read error:') === 0) {
-        return 'Config file could not be read. Check file permissions and path.';
-      }
-      if (w.indexOf('Invalid custom model ID:') === 0) {
-        return 'A custom model entry in config has an invalid ID format.';
-      }
-      return w;
-    },
-
     providerAuthClass(p) {
       if (p.auth_status === 'configured') return 'auth-configured';
       if (p.auth_status === 'not_set' || p.auth_status === 'missing') return 'auth-not-set';
@@ -387,32 +351,6 @@ function settingsPage() {
       if (t === 'balanced') return 'tier-balanced';
       if (t === 'fast') return 'tier-fast';
       return '';
-    },
-
-    modelStatusBadgeClass(status) {
-      var s = String(status || '').toLowerCase();
-      if (s === 'verified' || s === 'catalog') return 'badge-success';
-      if (s === 'stale') return 'badge-warning';
-      if (s === 'unverified') return 'badge-muted';
-      return 'badge-muted';
-    },
-
-    modelStatusText(status) {
-      var s = String(status || '').toLowerCase();
-      if (s === 'catalog') return 'Catalog';
-      if (s === 'verified') return 'Verified';
-      if (s === 'stale') return 'Stale';
-      if (s === 'unverified') return 'Unverified';
-      return '-';
-    },
-
-    formatVerifiedAt(ts) {
-      if (!ts) return '-';
-      try {
-        return new Date(ts).toLocaleString();
-      } catch(e) {
-        return ts;
-      }
     },
 
     formatCost(cost) {
@@ -462,6 +400,54 @@ function settingsPage() {
       }
     },
 
+    async startCopilotOAuth() {
+      this.copilotOAuth.polling = true;
+      this.copilotOAuth.userCode = '';
+      try {
+        var resp = await OpenFangAPI.post('/api/providers/github-copilot/oauth/start', {});
+        this.copilotOAuth.userCode = resp.user_code;
+        this.copilotOAuth.verificationUri = resp.verification_uri;
+        this.copilotOAuth.pollId = resp.poll_id;
+        this.copilotOAuth.interval = resp.interval || 5;
+        window.open(resp.verification_uri, '_blank');
+        this.pollCopilotOAuth();
+      } catch(e) {
+        OpenFangToast.error('Failed to start Copilot login: ' + e.message);
+        this.copilotOAuth.polling = false;
+      }
+    },
+
+    pollCopilotOAuth() {
+      var self = this;
+      setTimeout(async function() {
+        if (!self.copilotOAuth.pollId) return;
+        try {
+          var resp = await OpenFangAPI.get('/api/providers/github-copilot/oauth/poll/' + self.copilotOAuth.pollId);
+          if (resp.status === 'complete') {
+            OpenFangToast.success('GitHub Copilot authenticated successfully!');
+            self.copilotOAuth = { polling: false, userCode: '', verificationUri: '', pollId: '', interval: 5 };
+            await self.loadProviders();
+            await self.loadModels();
+          } else if (resp.status === 'pending') {
+            if (resp.interval) self.copilotOAuth.interval = resp.interval;
+            self.pollCopilotOAuth();
+          } else if (resp.status === 'expired') {
+            OpenFangToast.error('Device code expired. Please try again.');
+            self.copilotOAuth = { polling: false, userCode: '', verificationUri: '', pollId: '', interval: 5 };
+          } else if (resp.status === 'denied') {
+            OpenFangToast.error('Access denied by user.');
+            self.copilotOAuth = { polling: false, userCode: '', verificationUri: '', pollId: '', interval: 5 };
+          } else {
+            OpenFangToast.error('OAuth error: ' + (resp.error || resp.status));
+            self.copilotOAuth = { polling: false, userCode: '', verificationUri: '', pollId: '', interval: 5 };
+          }
+        } catch(e) {
+          OpenFangToast.error('Poll error: ' + e.message);
+          self.copilotOAuth = { polling: false, userCode: '', verificationUri: '', pollId: '', interval: 5 };
+        }
+      }, self.copilotOAuth.interval * 1000);
+    },
+
     async testProvider(provider) {
       this.providerTesting[provider.id] = true;
       this.providerTestResults[provider.id] = null;
@@ -500,116 +486,6 @@ function settingsPage() {
         OpenFangToast.error('Failed to save URL: ' + e.message);
       }
       this.providerUrlSaving[provider.id] = false;
-    },
-
-    async verifyCustomModel() {
-      var normalizedInput = this.normalizeOpenRouterModelInput(this.customModelInput);
-      if (!normalizedInput) {
-        OpenFangToast.error('Paste an OpenRouter model ID first');
-        return;
-      }
-      this.customModelVerifying = true;
-      this.customModelVerifyResult = null;
-      try {
-        var res = await OpenFangAPI.post('/api/models/custom/verify', {
-          provider: 'openrouter',
-          model_input: normalizedInput
-        });
-        this.customModelVerifyResult = res;
-        if (res.verified) {
-          OpenFangToast.success('Model verified: ' + (res.display_id || normalizedInput));
-        } else {
-          OpenFangToast.warning((res.reason || 'Model could not be verified') + ' (save still allowed)');
-        }
-      } catch(e) {
-        OpenFangToast.error('Verify failed: ' + e.message);
-      }
-      this.customModelVerifying = false;
-    },
-
-    async saveCustomModel() {
-      var normalizedInput = this.normalizeOpenRouterModelInput(this.customModelInput);
-      if (!normalizedInput) {
-        OpenFangToast.error('Paste an OpenRouter model ID first');
-        return;
-      }
-      this.customModelSaving = true;
-      try {
-        var saveBody = {
-          provider: 'openrouter',
-          model: normalizedInput
-        };
-        var label = (this.customModelLabel || '').trim();
-        if (label) saveBody.label = label;
-        var res = await OpenFangAPI.post('/api/models/custom', saveBody);
-        OpenFangToast.success('Saved custom model: ' + ((res.custom_model && res.custom_model.display_id) || normalizedInput));
-        this.customModelInput = '';
-        this.customModelLabel = '';
-        this.customModelVerifyResult = null;
-        await this.loadModels();
-      } catch(e) {
-        OpenFangToast.error('Save failed: ' + e.message);
-      }
-      this.customModelSaving = false;
-    },
-
-    async useCustomModel(entry, target) {
-      if (!entry || !entry.model) return;
-      var key = target + ':' + entry.provider + ':' + entry.model;
-      this.customModelUseBusy[key] = true;
-      try {
-        await OpenFangAPI.post('/api/models/custom/use', {
-          provider: entry.provider || 'openrouter',
-          model: entry.model,
-          target: target || 'default'
-        });
-        OpenFangToast.success('Updated ' + (target || 'default') + ' model to ' + (entry.display_id || entry.model));
-        await Promise.all([this.loadModels(), this.loadSysInfo()]);
-      } catch(e) {
-        OpenFangToast.error('Failed to set model: ' + e.message);
-      }
-      this.customModelUseBusy[key] = false;
-    },
-
-    customModelDeletePath(entry) {
-      var provider = encodeURIComponent(entry.provider || 'openrouter');
-      var model = String(entry.model || '')
-        .split('/')
-        .map(function(seg) { return encodeURIComponent(seg); })
-        .join('/');
-      return '/api/models/custom/' + provider + '/' + model;
-    },
-
-    async removeCustomModel(entry, force) {
-      if (!entry || !entry.model) return;
-      var key = (force ? 'force:' : '') + entry.provider + ':' + entry.model;
-      this.customModelDeleteBusy[key] = true;
-      try {
-        var path = this.customModelDeletePath(entry) + '?force=' + (force ? 'true' : 'false');
-        await OpenFangAPI.del(path);
-        OpenFangToast.success('Removed custom model ' + (entry.display_id || entry.model));
-        await Promise.all([this.loadModels(), this.loadSysInfo()]);
-      } catch(e) {
-        var msg = (e && e.message) ? e.message : '';
-        var lower = msg.toLowerCase();
-        var isConflict = lower.indexOf('currently in use') >= 0 || lower.indexOf('force=true') >= 0;
-        if (!force && isConflict) {
-          var confirmed = window.confirm('This model is in use as default or fallback. Force remove and automatically switch to a safe fallback model?');
-          if (confirmed) {
-            this.customModelDeleteBusy[key] = false;
-            await this.removeCustomModel(entry, true);
-            return;
-          }
-        }
-        if (force && isConflict) {
-          OpenFangToast.error('Force remove blocked: no safe fallback model available.');
-        } else if (isConflict) {
-          OpenFangToast.warning('Model is currently in use. Use force remove to continue.');
-        } else {
-          OpenFangToast.error('Remove failed: ' + msg);
-        }
-      }
-      this.customModelDeleteBusy[key] = false;
     },
 
     // -- Security methods --

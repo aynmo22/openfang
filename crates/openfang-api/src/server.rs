@@ -49,10 +49,7 @@ pub async fn build_router(
         bridge_manager: tokio::sync::Mutex::new(bridge),
         channels_config: tokio::sync::RwLock::new(channels_config),
         shutdown_notify: Arc::new(tokio::sync::Notify::new()),
-        config_write_lock: std::sync::Mutex::new(()),
-        last_config_write_fingerprint: tokio::sync::RwLock::new(None),
-        model_warnings: tokio::sync::RwLock::new(Vec::new()),
-        openrouter_catalog_cache: tokio::sync::RwLock::new(None),
+        clawhub_cache: dashmap::DashMap::new(),
     });
 
     // CORS: allow localhost origins by default. If API key is set, the API
@@ -161,6 +158,10 @@ pub async fn build_router(
             axum::routing::post(routes::reset_session),
         )
         .route(
+            "/api/agents/{id}/history",
+            axum::routing::delete(routes::clear_agent_history),
+        )
+        .route(
             "/api/agents/{id}/session/compact",
             axum::routing::post(routes::compact_session),
         )
@@ -171,6 +172,10 @@ pub async fn build_router(
         .route(
             "/api/agents/{id}/model",
             axum::routing::put(routes::set_model),
+        )
+        .route(
+            "/api/agents/{id}/tools",
+            axum::routing::get(routes::get_agent_tools).put(routes::set_agent_tools),
         )
         .route(
             "/api/agents/{id}/skills",
@@ -317,11 +322,19 @@ pub async fn build_router(
             axum::routing::get(routes::clawhub_skill_detail),
         )
         .route(
+            "/api/clawhub/skill/{slug}/code",
+            axum::routing::get(routes::clawhub_skill_code),
+        )
+        .route(
             "/api/clawhub/install",
             axum::routing::post(routes::clawhub_install),
         )
         // Hands endpoints
         .route("/api/hands", axum::routing::get(routes::list_hands))
+        .route(
+            "/api/hands/install",
+            axum::routing::post(routes::install_hand),
+        )
         .route(
             "/api/hands/active",
             axum::routing::get(routes::list_active_hands),
@@ -338,6 +351,11 @@ pub async fn build_router(
         .route(
             "/api/hands/{hand_id}/install-deps",
             axum::routing::post(routes::install_hand_deps),
+        )
+        .route(
+            "/api/hands/{hand_id}/settings",
+            axum::routing::get(routes::get_hand_settings)
+                .put(routes::update_hand_settings),
         )
         .route(
             "/api/hands/instances/{id}/pause",
@@ -380,6 +398,27 @@ pub async fn build_router(
         .route(
             "/api/network/status",
             axum::routing::get(routes::network_status),
+        )
+        // Agent communication (Comms) endpoints
+        .route(
+            "/api/comms/topology",
+            axum::routing::get(routes::comms_topology),
+        )
+        .route(
+            "/api/comms/events",
+            axum::routing::get(routes::comms_events),
+        )
+        .route(
+            "/api/comms/events/stream",
+            axum::routing::get(routes::comms_events_stream),
+        )
+        .route(
+            "/api/comms/send",
+            axum::routing::post(routes::comms_send),
+        )
+        .route(
+            "/api/comms/task",
+            axum::routing::post(routes::comms_task),
         )
         // Tools endpoint
         .route("/api/tools", axum::routing::get(routes::list_tools))
@@ -425,7 +464,8 @@ pub async fn build_router(
         )
         .route(
             "/api/budget/agents/{id}",
-            axum::routing::get(routes::agent_budget_status),
+            axum::routing::get(routes::agent_budget_status)
+                .put(routes::update_agent_budget),
         )
         // Session endpoints
         .route("/api/sessions", axum::routing::get(routes::list_sessions))
@@ -451,27 +491,28 @@ pub async fn build_router(
         // Model catalog endpoints
         .route("/api/models", axum::routing::get(routes::list_models))
         .route(
-            "/api/models/custom/verify",
-            axum::routing::post(routes::verify_custom_model),
-        )
-        .route(
-            "/api/models/custom",
-            axum::routing::post(routes::save_custom_model),
-        )
-        .route(
-            "/api/models/custom/use",
-            axum::routing::post(routes::use_custom_model),
-        )
-        .route(
-            "/api/models/custom/{provider}/{*model}",
-            axum::routing::delete(routes::delete_custom_model),
-        )
-        .route(
             "/api/models/aliases",
             axum::routing::get(routes::list_aliases),
         )
+        .route(
+            "/api/models/custom",
+            axum::routing::post(routes::add_custom_model),
+        )
+        .route(
+            "/api/models/custom/{*id}",
+            axum::routing::delete(routes::remove_custom_model),
+        )
         .route("/api/models/{*id}", axum::routing::get(routes::get_model))
         .route("/api/providers", axum::routing::get(routes::list_providers))
+        // Copilot OAuth (must be before parametric {name} routes)
+        .route(
+            "/api/providers/github-copilot/oauth/start",
+            axum::routing::post(routes::copilot_oauth_start),
+        )
+        .route(
+            "/api/providers/github-copilot/oauth/poll/{poll_id}",
+            axum::routing::get(routes::copilot_oauth_poll),
+        )
         .route(
             "/api/providers/{name}/key",
             axum::routing::post(routes::set_provider_key).delete(routes::delete_provider_key),
@@ -660,93 +701,38 @@ pub async fn run_daemon(
     kernel.set_self_handle();
     kernel.start_background_agents();
 
-    let (app, state) = build_router(kernel.clone(), addr).await;
-
-    // Startup custom-model verification pass (non-blocking, batched fetch).
+    // Config file hot-reload watcher (polls every 30 seconds)
     {
-        let state_for_verify = state.clone();
-        tokio::spawn(async move {
-            let _ = routes::refresh_custom_models_from_openrouter(state_for_verify, true).await;
-        });
-    }
-
-    // Config file watcher with debounce + self-write skip fingerprint.
-    {
-        let state_for_watch = state.clone();
+        let k = kernel.clone();
         let config_path = kernel.config.home_dir.join("config.toml");
         tokio::spawn(async move {
             let mut last_modified = std::fs::metadata(&config_path)
                 .and_then(|m| m.modified())
                 .ok();
-            let mut last_len = std::fs::metadata(&config_path).map(|m| m.len()).ok();
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                let metadata = std::fs::metadata(&config_path).ok();
-                let current_modified = metadata.as_ref().and_then(|m| m.modified().ok());
-                let current_len = metadata.as_ref().map(|m| m.len());
-                if current_modified == last_modified && current_len == last_len {
-                    continue;
-                }
-                last_modified = current_modified;
-                last_len = current_len;
-
-                tokio::time::sleep(std::time::Duration::from_millis(
-                    routes::CONFIG_WATCHER_DEBOUNCE_MS,
-                ))
-                .await;
-
-                let content = match std::fs::read_to_string(&config_path) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::warn!("Config watcher read failed: {e}");
-                        continue;
-                    }
-                };
-                let fp = compute_fingerprint(content.as_bytes());
-
-                let skip_self_write = {
-                    let marker = state_for_watch.last_config_write_fingerprint.read().await;
-                    marker.as_ref().copied() == Some(fp)
-                };
-                if skip_self_write {
-                    let mut marker = state_for_watch.last_config_write_fingerprint.write().await;
-                    *marker = None;
-                    continue;
-                }
-
-                if let Err(e) = toml::from_str::<toml::Value>(&content) {
-                    let mut warnings = state_for_watch.model_warnings.write().await;
-                    warnings.retain(|w| !w.starts_with("config-parse:"));
-                    warnings.push(format!("config-parse: {e}"));
-                    tracing::warn!("Config hot-reload parse check failed: {e}");
-                    continue;
-                }
-
-                {
-                    let mut warnings = state_for_watch.model_warnings.write().await;
-                    warnings.retain(|w| !w.starts_with("config-parse:"));
-                    warnings.retain(|w| !w.starts_with("config-reload:"));
-                }
-
-                tracing::info!("Config file changed, reloading...");
-                match state_for_watch.kernel.reload_config() {
-                    Ok(plan) => {
-                        if plan.has_changes() {
-                            tracing::info!("Config hot-reload applied: {:?}", plan.hot_actions);
-                        } else {
-                            tracing::debug!("Config hot-reload: no actionable changes");
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                let current = std::fs::metadata(&config_path)
+                    .and_then(|m| m.modified())
+                    .ok();
+                if current != last_modified && current.is_some() {
+                    last_modified = current;
+                    tracing::info!("Config file changed, reloading...");
+                    match k.reload_config() {
+                        Ok(plan) => {
+                            if plan.has_changes() {
+                                tracing::info!("Config hot-reload applied: {:?}", plan.hot_actions);
+                            } else {
+                                tracing::debug!("Config hot-reload: no actionable changes");
+                            }
                         }
-                    }
-                    Err(e) => {
-                        tracing::warn!("Config hot-reload failed: {e}");
-                        let mut warnings = state_for_watch.model_warnings.write().await;
-                        warnings.retain(|w| !w.starts_with("config-reload:"));
-                        warnings.push(format!("config-reload: {e}"));
+                        Err(e) => tracing::warn!("Config hot-reload failed: {e}"),
                     }
                 }
             }
         });
     }
+
+    let (app, state) = build_router(kernel.clone(), addr).await;
 
     // Write daemon info file
     if let Some(info_path) = daemon_info_path {
@@ -813,13 +799,6 @@ pub async fn run_daemon(
 
     info!("OpenFang daemon stopped");
     Ok(())
-}
-
-fn compute_fingerprint(bytes: &[u8]) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    bytes.hash(&mut hasher);
-    hasher.finish()
 }
 
 /// SECURITY: Restrict file permissions to owner-only (0600) on Unix.

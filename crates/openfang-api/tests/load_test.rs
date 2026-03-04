@@ -61,6 +61,7 @@ async fn start_test_server() -> TestServer {
         model_warnings: tokio::sync::RwLock::new(Vec::new()),
         openrouter_catalog_cache: tokio::sync::RwLock::new(None),
         shutdown_notify: Arc::new(tokio::sync::Notify::new()),
+        clawhub_cache: dashmap::DashMap::new(),
     });
 
     let app = Router::new()
@@ -544,7 +545,7 @@ async fn load_spawn_kill_cycle() {
         .await
         .unwrap();
     let remaining = agents.as_array().map(|a| a.len()).unwrap_or(0);
-    assert_eq!(remaining, 0, "All agents should be killed");
+    assert_eq!(remaining, 1, "Only default assistant should remain");
 }
 
 /// Test: Prometheus metrics endpoint under sustained load.
