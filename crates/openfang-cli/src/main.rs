@@ -1306,8 +1306,14 @@ fn detect_best_provider() -> (&'static str, &'static str, &'static str) {
         ui::success("Detected Gemini (GOOGLE_API_KEY)");
         return ("gemini", "GOOGLE_API_KEY", "gemini-2.5-flash");
     }
+    // Check if Ollama is running locally (no API key needed)
+    if check_ollama_available() {
+        ui::success("Detected Ollama running locally (no API key needed)");
+        return ("ollama", "OLLAMA_API_KEY", "llama3.2");
+    }
     ui::hint("No LLM provider API keys found");
     ui::hint("Groq offers a free tier: https://console.groq.com");
+    ui::hint("Or install Ollama for local models: https://ollama.com");
     ("groq", "GROQ_API_KEY", "llama-3.3-70b-versatile")
 }
 
@@ -1331,6 +1337,15 @@ fn provider_list() -> Vec<(&'static str, &'static str, &'static str, &'static st
             "OpenRouter",
         ),
     ]
+}
+
+/// Quick probe to check if Ollama is running on localhost.
+fn check_ollama_available() -> bool {
+    std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], 11434)),
+        std::time::Duration::from_millis(500),
+    )
+    .is_ok()
 }
 
 /// Write config.toml if it doesn't already exist.
@@ -2060,20 +2075,23 @@ fn cmd_doctor(json: bool, repair: bool) {
             }
             let answer = prompt_input("    Create default config? [Y/n] ");
             if answer.is_empty() || answer.starts_with('y') || answer.starts_with('Y') {
-                let default_config = r#"# OpenFang Agent OS configuration
+                let (provider, api_key_env, model) = detect_best_provider();
+                let default_config = format!(
+                    r#"# OpenFang Agent OS configuration
 # See https://github.com/RightNow-AI/openfang for documentation
 
 # For Docker, change to "0.0.0.0:4200" or set OPENFANG_LISTEN env var.
 api_listen = "127.0.0.1:4200"
 
 [default_model]
-provider = "groq"
-model = "llama-3.3-70b-versatile"
-api_key_env = "GROQ_API_KEY"
+provider = "{provider}"
+model = "{model}"
+api_key_env = "{api_key_env}"
 
 [memory]
 decay_rate = 0.05
-"#;
+"#
+                );
                 let _ = std::fs::create_dir_all(&openfang_dir);
                 if std::fs::write(&config_path, default_config).is_ok() {
                     restrict_file_permissions(&config_path);
@@ -2530,12 +2548,20 @@ decay_rate = 0.05
         }
 
         // Check for prompt injection issues in skill definitions
+        // Only flag Critical-severity warnings (Warning-level hits are expected
+        // in bundled skills that mention shell commands in educational context).
         let skills = skill_reg.list();
         let mut injection_warnings = 0;
         for skill in &skills {
             if let Some(ref prompt) = skill.manifest.prompt_context {
                 let warnings = openfang_skills::verify::SkillVerifier::scan_prompt_content(prompt);
-                if !warnings.is_empty() {
+                let has_critical = warnings.iter().any(|w| {
+                    matches!(
+                        w.severity,
+                        openfang_skills::verify::WarningSeverity::Critical
+                    )
+                });
+                if has_critical {
                     injection_warnings += 1;
                     if !json {
                         ui::check_warn(&format!(
