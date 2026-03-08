@@ -937,7 +937,7 @@ impl OpenFangKernel {
             workflows: WorkflowEngine::new(),
             triggers: TriggerEngine::new(),
             background,
-            audit_log: Arc::new(AuditLog::new()),
+            audit_log: Arc::new(AuditLog::with_db(memory.usage_conn())),
             metering,
             default_driver: driver,
             wasm_sandbox,
@@ -4719,8 +4719,8 @@ fn apply_budget_defaults(
     budget: &openfang_types::config::BudgetConfig,
     resources: &mut ResourceQuota,
 ) {
-    // Only override hourly if agent has the built-in default (1.0) and global is set
-    if budget.max_hourly_usd > 0.0 && resources.max_cost_per_hour_usd == 1.0 {
+    // Only override hourly if agent has unlimited (0.0) and global is set
+    if budget.max_hourly_usd > 0.0 && resources.max_cost_per_hour_usd == 0.0 {
         resources.max_cost_per_hour_usd = budget.max_hourly_usd;
     }
     // Only override daily/monthly if agent has unlimited (0.0) and global is set
