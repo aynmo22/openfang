@@ -118,6 +118,7 @@ async fn test_full_daemon_lifecycle() {
         openrouter_catalog_cache: tokio::sync::RwLock::new(None),
         shutdown_notify: Arc::new(tokio::sync::Notify::new()),
         clawhub_cache: dashmap::DashMap::new(),
+        provider_probe_cache: openfang_runtime::provider_health::ProbeCache::new(),
     });
 
     let app = Router::new()
@@ -246,6 +247,7 @@ async fn test_server_immediate_responsiveness() {
         openrouter_catalog_cache: tokio::sync::RwLock::new(None),
         shutdown_notify: Arc::new(tokio::sync::Notify::new()),
         clawhub_cache: dashmap::DashMap::new(),
+        provider_probe_cache: openfang_runtime::provider_health::ProbeCache::new(),
     });
 
     let app = Router::new()

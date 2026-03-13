@@ -62,6 +62,7 @@ async fn start_test_server() -> TestServer {
         openrouter_catalog_cache: tokio::sync::RwLock::new(None),
         shutdown_notify: Arc::new(tokio::sync::Notify::new()),
         clawhub_cache: dashmap::DashMap::new(),
+        provider_probe_cache: openfang_runtime::provider_health::ProbeCache::new(),
     });
 
     let app = Router::new()
