@@ -44,6 +44,8 @@ pub fn bundled_hands() -> Vec<(&'static str, &'static str, &'static str)> {
             "forge",
             include_str!("../bundled/forge/HAND.toml"),
             include_str!("../bundled/forge/SKILL.md"),
+        ),
+        (
             "trader",
             include_str!("../bundled/trader/HAND.toml"),
             include_str!("../bundled/trader/SKILL.md"),
@@ -79,7 +81,7 @@ mod tests {
     #[test]
     fn bundled_hands_count() {
         let hands = bundled_hands();
-        assert_eq!(hands.len(), 8);
+        assert_eq!(hands.len(), 9);
     }
 
     #[test]
@@ -226,6 +228,9 @@ mod tests {
         assert!(!def.dashboard.metrics.is_empty());
         assert!((def.agent.temperature - 0.3).abs() < f32::EPSILON);
         assert_eq!(def.agent.max_iterations, Some(50));
+    }
+
+    #[test]
     fn parse_trader_hand() {
         let (id, toml_content, skill_content) = bundled_hands()
             .into_iter()
